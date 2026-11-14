@@ -2,9 +2,9 @@
 
 Userspace daemon, CLI utility, and LuCI web application feed for [NNRRWrt](https://github.com/grislux55/nnrrwrt), covering optical PON line management, dual-stack isolated TR-069 CWMP sandboxing, real-time gateway telemetry, IPTV bridge isolation, and read-only UBI calibration/identity backup.
 
-[NNRRWrt](https://github.com/grislux55/nnrrwrt) 的用户态守护进程、命令行工具与 LuCI 应用软件包源，涵盖 PON 光路与协议栈管理、双栈隔离 TR-069 CWMP 沙盒、网关实时总览仪表盘、IPTV 专口桥接隔离以及关键 UBI 分区只读备份（PON 基础组件基于上游 [pbs05/openwrt-pon-userspace](https://github.com/pbs05/openwrt-pon-userspace) 演进扩展）。
+[NNRRWrt](https://github.com/grislux55/nnrrwrt) 的用户态守护进程、命令行工具与 LuCI 应用软件包源，涵盖 PON 光路与协议栈管理、双栈隔离 TR-069 CWMP 沙盒、网关实时总览仪表盘、IPTV 专口桥接隔离以及关键 UBI 分区只读备份（PON 基础组件基于上游 [pbs05/openwrt-pon-userspace](https://github.com/pbs05/openwrt-pon-userspace) 扩展）。
 
-## Package Matrix / 软件包一览
+## Packages / 软件包一览
 
 ### 1. Gateway Overview UI / 网关总览界面
 

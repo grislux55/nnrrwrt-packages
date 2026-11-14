@@ -1117,7 +1117,7 @@ return view.extend({
 		});
 
 		var svcCards = services.map(function(svc) {
-			var stateLabel = _('Standby (0 proc)');
+				var stateLabel = _('Standby');
 			if (svc.state === 'running')
 				stateLabel = _('Running');
 			else if (svc.state === 'active')
@@ -1158,10 +1158,10 @@ return view.extend({
 			E('div', { 'class': 'nnrrwrt-panel-body' }, [
 				E('div', { 'class': 'nnrrwrt-rate-sub' },
 					fmtNum(activeCount, 0, 0) + ' ' + _('active') + ', ' +
-					fmtNum(standbyCount, 0, 0) + ' ' + _('on standby without background processes')),
+						fmtNum(standbyCount, 0, 0) + ' ' + _('on standby')),
 				E('div', { 'class': 'nnrrwrt-svc-grid' }, svcCards),
 				E('div', { 'class': 'nnrrwrt-svc-note' },
-					_('Unconfigured services such as Tailscale and DDNS stay in zero-process standby until enabled.'))
+						_('Optional services such as Tailscale and DDNS stay stopped until configured and enabled.'))
 			])
 		]);
 	},

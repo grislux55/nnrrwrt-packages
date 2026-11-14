@@ -293,7 +293,7 @@ return view.extend({
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('Critical UBI volume health')),
 			E('div', { 'class': 'cbi-section-descr' },
-				_('Read-only status of calibration, identity, bootloader and U-Boot environment volumes. The bl2 partition is intentionally excluded and stays read-only.')),
+				_('Read-only status of calibration, identity, bootloader and U-Boot environment UBI volumes (bosa, ri, fip, ubootenv, ubootenv2).')),
 			E('div', { 'class': summaryClass }, summaryText),
 			E('table', { 'class': 'table' }, rows)
 		]);
@@ -532,14 +532,14 @@ return view.extend({
 			}
 
 			boardRows.push(E('div', { 'class': 'cbi-value' }, [
-				E('label', { 'class': 'cbi-value-title' }, _('Full critical UBI backup')),
+				E('label', { 'class': 'cbi-value-title' }, _('Critical UBI volume backup')),
 				E('div', { 'class': 'cbi-value-field' }, [
 					E('button', {
 						'class': 'cbi-button cbi-button-apply',
 						'click': ui.createHandlerFn(this, 'handleCriticalBackup')
-					}, [ _('Download full UBI backup (.tar.gz)') ]),
+					}, [ _('Download UBI backup (.tar.gz)') ]),
 					E('div', { 'class': 'cbi-value-description' },
-						_('Archives bosa, ri, fip, ubootenv and ubootenv2 (read-only, excluding bl2) with SHA-256 MANIFEST.txt. If any volume is missing or unreadable, available volumes are still included with a warning.'))
+						_('Exports a read-only archive of bosa, ri, fip, ubootenv and ubootenv2 with SHA-256 MANIFEST.txt. If any volume is missing or unreadable, available volumes are still archived with a warning.'))
 				])
 			]));
 

@@ -540,7 +540,7 @@ cmd_backup()
 		printf 'model=%s\n' "$model_name"
 		printf 'integrity=%s\n' "$integrity"
 		printf 'volumes_ok=%d/%d\n' "$ok_count" "$total_count"
-		printf 'excluded_volumes=bl2 (read-only boot partition intentionally excluded)\n'
+		printf 'volumes=bosa,ri,fip,ubootenv,ubootenv2\n'
 		printf '\n'
 		printf 'volume\tstatus\tstorage\tdevice\tvolume_type\tbytes\tsha256\tfile\tnote\n'
 		cat "$work/manifest_rows.tsv"

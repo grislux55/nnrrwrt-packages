@@ -1017,8 +1017,8 @@ msgstr "只读"
 msgid "Critical UBI volume health"
 msgstr "关键 UBI 卷健康状态"
 
-msgid "Read-only status of calibration, identity, bootloader and U-Boot environment volumes. The bl2 partition is intentionally excluded and stays read-only."
-msgstr "仅展示校准、身份、引导加载程序与 U-Boot 环境变量卷的只读健康状态。只读 bl2 分区已刻意排除，不受影响。"
+msgid "Read-only status of calibration, identity, bootloader and U-Boot environment UBI volumes (bosa, ri, fip, ubootenv, ubootenv2)."
+msgstr "校准、身份、引导加载程序与 U-Boot 环境变量 UBI 卷（bosa、ri、fip、ubootenv、ubootenv2）的只读健康状态。"
 
 msgid "Single volume export (read-only)"
 msgstr "单卷原始导出（只读）"
@@ -1026,14 +1026,14 @@ msgstr "单卷原始导出（只读）"
 msgid "Download %s"
 msgstr "下载 %s"
 
-msgid "Full critical UBI backup"
-msgstr "全量关键 UBI 卷备份"
+msgid "Critical UBI volume backup"
+msgstr "关键 UBI 卷备份"
 
-msgid "Download full UBI backup (.tar.gz)"
-msgstr "下载全量 UBI 备份（.tar.gz）"
+msgid "Download UBI backup (.tar.gz)"
+msgstr "下载 UBI 备份（.tar.gz）"
 
-msgid "Archives bosa, ri, fip, ubootenv and ubootenv2 (read-only, excluding bl2) with SHA-256 MANIFEST.txt. If any volume is missing or unreadable, available volumes are still included with a warning."
-msgstr "打包导出 bosa、ri、fip、ubootenv 和 ubootenv2（只读，不含 bl2）及 SHA-256 校验清单 MANIFEST.txt；若部分卷缺失或读取失败，仍可下载已成功读取的数据并提示警告。"
+msgid "Exports a read-only archive of bosa, ri, fip, ubootenv and ubootenv2 with SHA-256 MANIFEST.txt. If any volume is missing or unreadable, available volumes are still archived with a warning."
+msgstr "只读打包导出 bosa、ri、fip、ubootenv 和 ubootenv2 及 SHA-256 校验清单 MANIFEST.txt；若部分卷缺失或读取失败，将打包其余可读卷并提示警告。"
 
 msgid "PON registration state (kernel: pon0-registration)"
 msgstr "PON 注册状态 (内核: pon0-registration)"

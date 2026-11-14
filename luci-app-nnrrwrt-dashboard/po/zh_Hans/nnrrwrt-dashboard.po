@@ -283,8 +283,8 @@ msgstr "运行内存"
 msgid "Storage"
 msgstr "存储空间"
 
-msgid "Standby (0 proc)"
-msgstr "待机（无进程）"
+msgid "Standby"
+msgstr "待机"
 
 msgid "Running"
 msgstr "运行中"
@@ -307,11 +307,11 @@ msgstr "管理启动项"
 msgid "active"
 msgstr "项启用"
 
-msgid "on standby without background processes"
-msgstr "项按需待机（零后台进程）"
+msgid "on standby"
+msgstr "项待机"
 
-msgid "Unconfigured services such as Tailscale and DDNS stay in zero-process standby until enabled."
-msgstr "Tailscale 与 DDNS 等可选组件在未配置时保持零后台进程待机，配置启用后自动拉起。"
+msgid "Optional services such as Tailscale and DDNS stay stopped until configured and enabled."
+msgstr "Tailscale 与 DDNS 等可选服务在配置并启用前保持停止状态。"
 
 msgid "Telemetry refresh failed; retrying automatically…"
 msgstr "状态刷新失败，正在自动重试…"
