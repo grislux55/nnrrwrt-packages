@@ -88,6 +88,9 @@ msgstr "LAN / 旁路中继端口"
 msgid "On"
 msgstr "亮起"
 
+msgid "Blinking"
+msgstr "闪烁"
+
 msgid "Off"
 msgstr "熄灭"
 
@@ -297,6 +300,9 @@ msgstr "已停止"
 
 msgid "LED Configuration"
 msgstr "LED 指示灯配置"
+
+msgid "CPU Scaling"
+msgstr "CPU 调频设置"
 
 msgid "Service Runtime & Navigation"
 msgstr "常驻服务与功能导航"

@@ -79,6 +79,24 @@ function readCpuStat() {
 	return { total, cores };
 }
 
+function readCpuFreq() {
+	let base = '/sys/devices/system/cpu/cpufreq/policy0';
+	if (!stat(base))
+		return null;
+	let cur_khz = readNumber(base + '/scaling_cur_freq') ?? readNumber(base + '/cpuinfo_cur_freq');
+	let min_khz = readNumber(base + '/scaling_min_freq') ?? readNumber(base + '/cpuinfo_min_freq');
+	let max_khz = readNumber(base + '/scaling_max_freq') ?? readNumber(base + '/cpuinfo_max_freq');
+	let governor = readTrim(base + '/scaling_governor');
+	if (cur_khz == null && !governor)
+		return null;
+	return {
+		cur_mhz: cur_khz != null ? int((cur_khz + 500) / 1000) : null,
+		min_mhz: min_khz != null ? int((min_khz + 500) / 1000) : null,
+		max_mhz: max_khz != null ? int((max_khz + 500) / 1000) : null,
+		governor: governor || null
+	};
+}
+
 function readStorage() {
 	for (let mp in ['/overlay', '/']) {
 		let st = statvfs(mp);
@@ -202,7 +220,52 @@ function readActiveTrigger(path) {
 	return m ? m[1] : raw;
 }
 
-function readLeds() {
+function evalLedState(base, trigger, brightness, pon) {
+	let lit = brightness > 0;
+	let blinking = false;
+	let pon_dev = (pon && pon.available && pon.device) ? pon.device : null;
+	let pon_running = pon_dev && pon.lifecycle != 'stopped';
+
+	if (trigger == 'timer') {
+		let delay_on = readNumber(base + '/delay_on') ?? 0;
+		let delay_off = readNumber(base + '/delay_off') ?? 0;
+		if (delay_on > 0 && delay_off > 0) {
+			lit = true;
+			blinking = true;
+		}
+	} else if (pon_running && trigger == (pon_dev + '-los')) {
+		if (!pon.optical_signal) {
+			lit = true;
+			blinking = true;
+		} else {
+			lit = false;
+		}
+	} else if (pon_running && trigger == (pon_dev + '-registration')) {
+		if (pon.optical_signal) {
+			lit = true;
+			blinking = pon.is_epon ? (pon.mpcp_state != 'registered') : (pon.onu_state != 'O5');
+		} else {
+			lit = false;
+		}
+	} else if (pon_running && trigger == (pon_dev + '-online')) {
+		lit = pon.optical_signal && pon.service_ready;
+	} else if (!lit && trigger == 'netdev' && (readNumber(base + '/offloaded') ?? 0) == 1) {
+		let dev = safeToken(readTrim(base + '/device_name'));
+		if (dev && (readNumber('/sys/class/net/' + dev + '/carrier') ?? 0) == 1) {
+			let link_cfg = (readNumber(base + '/link') ?? 0) ||
+				(readNumber(base + '/link_10') ?? 0) ||
+				(readNumber(base + '/link_100') ?? 0) ||
+				(readNumber(base + '/link_1000') ?? 0) ||
+				(readNumber(base + '/link_2500') ?? 0);
+			if (link_cfg)
+				lit = true;
+		}
+	}
+
+	return { lit, blinking };
+}
+
+function readLeds(pon) {
 	let dir = lsdir('/sys/class/leds');
 	if (!dir)
 		return [];
@@ -231,13 +294,15 @@ function readLeds() {
 		let brightness = readNumber(base + '/brightness') ?? 0;
 		let max_b = readNumber(base + '/max_brightness') ?? 255;
 		let trigger = readActiveTrigger(base + '/trigger');
+		let st = evalLedState(base, trigger, brightness, pon);
 		push(out, {
 			sysfs: item.sysfs,
 			label: item.label,
 			color: item.color,
 			brightness,
 			max_brightness: max_b,
-			lit: brightness > 0,
+			lit: st.lit,
+			blinking: st.blinking,
 			trigger
 		});
 	}
@@ -249,6 +314,7 @@ function readLeds() {
 		let brightness = readNumber(base + '/brightness') ?? 0;
 		let max_b = readNumber(base + '/max_brightness') ?? 255;
 		let trigger = readActiveTrigger(base + '/trigger');
+		let st = evalLedState(base, trigger, brightness, pon);
 		let color = index(name, 'red') >= 0 ? 'red' : (index(name, 'yellow') >= 0 || index(name, 'amber') >= 0 ? 'amber' : 'green');
 		push(out, {
 			sysfs: name,
@@ -256,7 +322,8 @@ function readLeds() {
 			color,
 			brightness,
 			max_brightness: max_b,
-			lit: brightness > 0,
+			lit: st.lit,
+			blinking: st.blinking,
 			trigger
 		});
 	}
@@ -306,7 +373,7 @@ function readPonStatus(uci_ctx) {
 	let reg = snap.registration || {};
 	let dp = snap.datapath || {};
 	let cnt = snap.counters || {};
-	let active_mode = line.active_mode_valid ? (line.active_mode || '') : '';
+	let active_mode = (line.active_mode_valid === false) ? '' : (line.active_mode || '');
 	let shown_mode = active_mode || line.configured_mode || cfg_mode;
 	let is_epon = index(shown_mode, 'epon-') == 0;
 
@@ -376,28 +443,20 @@ function readAccel(uci_ctx) {
 		bind_rate: readTrim('/sys/kernel/debug/ppe/bind_rate')
 	};
 
-	let fd = open('/sys/kernel/debug/ppe/entries', 'r');
-	if (fd) {
+	let summary_raw = readTrim('/sys/kernel/debug/ppe/summary');
+	if (summary_raw != null) {
 		ppe.available = true;
-		for (let line = fd.read('line'); length(line); line = fd.read('line')) {
-			let s = trim(line);
-			if (!length(s))
+		for (let tok in split(summary_raw, /\s+/)) {
+			let kv = split(tok, '=', 2);
+			if (length(kv) != 2)
 				continue;
-			ppe.total++;
-			if (match(s, /(^|\s)(BND|BIND)(\s|$)/))
-				ppe.bind++;
-			else if (match(s, /(^|\s)(UNB|UNBIND)(\s|$)/))
-				ppe.unbind++;
-			else if (match(s, /(^|\s)FIN(\s|$)/))
-				ppe.fin++;
-			if (index(s, 'L2B') >= 0)
-				ppe.l2b++;
-			if (match(s, /IPv4|IPV4/))
-				ppe.ipv4++;
-			if (match(s, /IPv6|IPV6/))
-				ppe.ipv6++;
+			let k = kv[0];
+			let v = +kv[1];
+			if (v == v && k in ['total', 'bind', 'unbind', 'fin', 'l2b', 'ipv4', 'ipv6'])
+				ppe[k] = v;
 		}
-		fd.close();
+	} else if (stat('/sys/kernel/debug/ppe/config')) {
+		ppe.available = true;
 	}
 
 	let sw_offload = false;
@@ -583,6 +642,16 @@ function readServices(uci_ctx) {
 		});
 	}
 
+	if (access('/etc/init.d/cpufreq', 'x')) {
+		let en = initEnabled('cpufreq');
+		push(items, {
+			id: 'cpufreq',
+			name: 'CPU Freq',
+			state: en ? 'active' : 'standby',
+			path: 'admin/system/cpufreq'
+		});
+	}
+
 	push(items, {
 		id: 'leds',
 		name: 'LED',
@@ -615,12 +684,14 @@ const methods = {
 			let ports = [];
 			for (let spec in port_specs)
 				push(ports, readPort(spec));
+			let pon = readPonStatus(uci_ctx);
 
 			return {
 				ts_ms: int(uptime_sec * 1000),
 				variant,
 				soc_temp_c: soc_temp_milli != null ? (soc_temp_milli / 1000.0) : null,
 				cpu_stat: readCpuStat(),
+				cpu_freq: readCpuFreq(),
 				conntrack: {
 					count: readNumber('/proc/sys/net/netfilter/nf_conntrack_count'),
 					max: readNumber('/proc/sys/net/netfilter/nf_conntrack_max')
@@ -630,9 +701,9 @@ const methods = {
 				chassis: {
 					ports,
 					usb: readUsbPorts(),
-					leds: readLeds()
+					leds: readLeds(pon)
 				},
-				pon: readPonStatus(uci_ctx),
+				pon,
 				accel: readAccel(uci_ctx),
 				services: readServices(uci_ctx)
 			};

@@ -416,6 +416,9 @@ return view.extend({
 		var hostname = board.hostname || 'NNRRWrt';
 		var model = board.model || 'Nokia XG-040G-MD';
 		var variantTag = tel.variant === 'usb-sfp' ? 'USB-SFP' : 'UBI';
+		var modelLabel = model.toUpperCase().indexOf('(' + variantTag.toUpperCase() + ')') >= 0
+			? model
+			: (model + ' (' + variantTag + ')');
 		var releaseDesc = (board.release && (board.release.description || board.release.version)) || 'NNRRWrt';
 		var kernel = board.kernel || '—';
 
@@ -429,8 +432,11 @@ return view.extend({
 			var dotClass = 'nnrrwrt-led-dot';
 			if (led.lit)
 				dotClass += ' is-' + (led.color || 'green');
+			if (led.blinking)
+				dotClass += ' is-blinking';
 			var tip = led.label + ' (' + led.sysfs + '): ' +
-				(led.lit ? _('On') : _('Off')) + ' [' + (led.trigger || 'none') + ']';
+				(led.blinking ? _('Blinking') : (led.lit ? _('On') : _('Off'))) +
+				' [' + (led.trigger || 'none') + ']';
 			return E('span', {
 				'class': 'nnrrwrt-led-pill' + (led.lit ? ' is-lit' : ''),
 				'title': tip,
@@ -552,7 +558,7 @@ return view.extend({
 				E('div', { 'class': 'nnrrwrt-identity' }, [
 					E('div', { 'class': 'nnrrwrt-identity-row' }, [
 						E('h2', { 'class': 'nnrrwrt-hostname', 'translate': 'no' }, hostname),
-						E('span', { 'class': 'nnrrwrt-model-tag', 'translate': 'no' }, model + ' (' + variantTag + ')')
+						E('span', { 'class': 'nnrrwrt-model-tag', 'translate': 'no' }, modelLabel)
 					]),
 					E('div', { 'class': 'nnrrwrt-meta-list' }, [
 						E('span', { 'class': 'nnrrwrt-meta-item' }, [
@@ -999,11 +1005,22 @@ return view.extend({
 			: _('Flow table stats inactive');
 
 		var cpuPct = st.cpuUsage.total;
+		var cpuFreq = tel.cpu_freq || null;
 		var loadArr = Array.isArray(sysinfo.load) ? sysinfo.load : [];
 		var loadStr = loadArr.length >= 3
 			? loadArr.slice(0, 3).map(function(v) { return (Number(v) / 65536).toFixed(2); }).join(', ')
 			: '—';
-		var cpuValText = (cpuPct !== null ? (fmtNum(cpuPct, 0, 0) + '% / ') : '') + _('Load') + ' ' + loadStr;
+		var freqPrefix = '';
+		if (cpuFreq) {
+			var fParts = [];
+			if (typeof cpuFreq.cur_mhz === 'number')
+				fParts.push(fmtNum(cpuFreq.cur_mhz, 0, 0) + NBSP + 'MHz');
+			if (cpuFreq.governor)
+				fParts.push(cpuFreq.governor);
+			if (fParts.length > 0)
+				freqPrefix = fParts.join(' · ') + ' / ';
+		}
+		var cpuValText = freqPrefix + (cpuPct !== null ? (fmtNum(cpuPct, 0, 0) + '% / ') : '') + _('Load') + ' ' + loadStr;
 		var cpuScale = cpuPct !== null ? (cpuPct / 100) : 0;
 
 		var memTotal = Number(mem.total) || 0;
@@ -1126,6 +1143,8 @@ return view.extend({
 				stateLabel = _('Stopped');
 
 			var displayName = svc.id === 'leds' ? _('LED Configuration') : svc.name;
+			if (svc.id === 'cpufreq')
+				displayName = _('CPU Scaling');
 
 			return E('a', {
 				'class': 'nnrrwrt-svc-item',
@@ -1138,7 +1157,7 @@ return view.extend({
 					}),
 					E('span', {
 						'class': 'nnrrwrt-svc-name',
-						'translate': svc.id === 'leds' ? null : 'no'
+						'translate': (svc.id === 'leds' || svc.id === 'cpufreq') ? null : 'no'
 					}, displayName)
 				]),
 				E('span', {
