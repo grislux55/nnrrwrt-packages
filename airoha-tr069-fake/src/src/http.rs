@@ -807,7 +807,7 @@ impl ConnectionRequestServer {
             if addr.ip().is_unspecified() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "ConnectionRequest must bind strictly to tr069 interface IP, never 0.0.0.0 or ::",
+                    "ConnectionRequest requires a concrete tr069 interface IP",
                 ));
             }
         }

@@ -484,7 +484,7 @@ fn maybe_start_conn_req(
             audit.record(
                 "INFO",
                 "conn_req",
-                &format!("Listening ConnectionRequest strictly on {:?}", srv.bound_addrs),
+                &format!("Listening for ConnectionRequest on {:?}", srv.bound_addrs),
             );
             Some(srv)
         }

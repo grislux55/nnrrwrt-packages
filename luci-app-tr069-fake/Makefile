@@ -8,7 +8,7 @@ LUCI_DEPENDS:=+luci-base +airoha-tr069-fake
 LUCI_PKGARCH:=all
 
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_MAINTAINER:=grislux55 <jebchou.hg@gmail.com>
 PKG_LICENSE:=Apache-2.0
 

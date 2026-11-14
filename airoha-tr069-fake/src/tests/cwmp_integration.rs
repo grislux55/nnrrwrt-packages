@@ -245,7 +245,7 @@ fn test_connection_request_rejects_wildcard_and_verifies_digest() {
     let wildcard = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)];
     assert!(ConnectionRequestServer::start(&wildcard, Arc::clone(&creds), Arc::clone(&trig), audit.clone()).is_err());
 
-    // Must bind strictly to explicit IP
+    // Bind to explicit IP
     let explicit = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)];
     let srv = ConnectionRequestServer::start(&explicit, Arc::clone(&creds), Arc::clone(&trig), audit).unwrap();
     let port = srv.bound_addrs[0].port();

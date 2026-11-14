@@ -107,7 +107,7 @@ return view.extend({
 		var btnResetVirtual = E('button', {
 			'class': 'cbi-button cbi-button-negative',
 			'click': ui.createHandlerFn(this, function() {
-				if (!confirm(_('Reset persisted CWMP virtual model and pending events back to local template? System settings will NOT be altered.')))
+					if (!confirm(_('Reset persisted CWMP virtual model and pending events to the local template?')))
 					return;
 				return fs.exec('/usr/libexec/tr069-fake-ctl', [ 'reset-virtual' ]).then(function(res) {
 					if (res.code !== 0)
@@ -122,7 +122,7 @@ return view.extend({
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('Sandbox & Dual-Stack Channel Status')),
 			E('div', { 'class': 'cbi-section-descr' },
-				_('TR-069 Fake isolates CWMP traffic inside dedicated netifd routing tables and firewall zone tr069. Remote ACS commands never reboot, flash, or alter host system files.')),
+					_('TR-069 Fake isolates CWMP traffic in dedicated netifd routing tables and firewall zone tr069, applying ACS RPCs within the virtual model.')),
 			table,
 			E('div', { 'class': 'cbi-page-actions' }, [ btnInform, ' ', btnResetVirtual ])
 		]);
@@ -174,7 +174,7 @@ return view.extend({
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('Sanitized /tmp Ring Audit Log')),
 			E('div', { 'class': 'cbi-section-descr' },
-				_('Stored exclusively in /tmp memory with automatic secret redaction; never written to NAND flash.')),
+					_('Stored in /tmp memory ring buffer with automatic credential redaction.')),
 			E('pre', {
 				'style': 'max-height: 240px; overflow-y: auto; padding: 8px; background: #1e1e1e; color: #dcdcdc; border-radius: 4px;'
 			}, logText || _('(empty)')),
@@ -206,7 +206,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('channel', form.Flag, 'omci_sync', _('Sync Empty Fields from OMCI'),
-			_('Read ME 134/136/340/347 exported defaults from airoha-pond; manually configured fields always take precedence.'));
+				_('Read ME 134/136/340/347 exported defaults from airoha-pond; manually configured fields take precedence.'));
 		o.rmempty = false;
 
 		o = s.taboption('channel', form.Value, 'pon_line', _('PON Line'));
@@ -297,7 +297,7 @@ return view.extend({
 		o.default = '43200';
 
 		o = s.taboption('acs', form.Flag, 'conn_req_enable', _('Enable ConnectionRequest Listener'),
-			_('Binds strictly to the isolated tr069 interface IPv4/IPv6 addresses (never wildcard 0.0.0.0 or ::).'));
+				_('Binds to the isolated tr069 interface IPv4/IPv6 addresses.'));
 		o.rmempty = false;
 
 		o = s.taboption('acs', form.Value, 'conn_req_port', _('ConnectionRequest Port'));
@@ -346,7 +346,7 @@ return view.extend({
 		o = cp.option(form.Value, 'value', _('Value'));
 
 		var dm = m.section(form.GridSection, 'download_map', _('Virtual Firmware Download Mappings'),
-			_('Virtual Download RPC matches URL substring and updates SoftwareVersion without downloading or flashing real firmware.'));
+				_('Matches the ACS Download RPC URL substring to update virtual SoftwareVersion and report TransferComplete.'));
 		dm.addremove = true;
 		dm.anonymous = true;
 		o = dm.option(form.Value, 'pattern', _('URL / Filename Match'));

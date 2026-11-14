@@ -225,7 +225,7 @@ impl FakeConfig {
         Ok(cfg)
     }
 
-    /// Applies OMCI-exported parameters ONLY where manual config is empty/unset.
+    /// Applies OMCI-exported parameters to unset config fields.
     pub fn apply_omci_fallback(&mut self, omci: &OmciExportData) {
         if self.vlan_id.is_none() {
             self.vlan_id = omci.management_vlan;

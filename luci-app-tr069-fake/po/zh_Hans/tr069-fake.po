@@ -23,8 +23,8 @@ msgstr "支持 IPv4/IPv6 双栈隔离通道、持久化 TR-098/TR-181 虚拟模�
 msgid "Sandbox & Dual-Stack Channel Status"
 msgstr "沙盒与双栈隔离通道状态"
 
-msgid "TR-069 Fake isolates CWMP traffic inside dedicated netifd routing tables and firewall zone tr069. Remote ACS commands never reboot, flash, or alter host system files."
-msgstr "TR-069 伪装客户端将 CWMP 流量严格隔离在独立 netifd 路由表与 tr069 防火墙区域内。远端 ACS 下发的命令绝不会重启设备、刷写固件或修改宿主系统配置。"
+msgid "TR-069 Fake isolates CWMP traffic in dedicated netifd routing tables and firewall zone tr069, applying ACS RPCs within the virtual model."
+msgstr "TR-069 伪装客户端将 CWMP 流量隔离在独立 netifd 路由表与 tr069 防火墙区域内，远端 ACS 命令仅作用于虚拟模型。"
 
 msgid "Daemon Status"
 msgstr "守护进程状态"
@@ -74,8 +74,8 @@ msgstr "触发 Inform 失败"
 msgid "Reset Virtual State"
 msgstr "重置虚拟状态"
 
-msgid "Reset persisted CWMP virtual model and pending events back to local template? System settings will NOT be altered."
-msgstr "确定将持久化 CWMP 虚拟模型与待上报事件重置为本地初始模板吗？系统真实配置不会被修改。"
+msgid "Reset persisted CWMP virtual model and pending events to the local template?"
+msgstr "确定将持久化 CWMP 虚拟模型与待上报事件重置为本地初始模板吗？"
 
 msgid "Virtual CWMP model reset to local template."
 msgstr "虚拟 CWMP 模型已重置为本地初始模板。"
@@ -87,7 +87,7 @@ msgid "Initial Template vs Persisted Virtual Model"
 msgstr "初始模板与当前持久化虚拟模型对照"
 
 msgid "Passwords are masked. Modified values reflect last-write-wins updates from either ACS SetParameterValues or LuCI."
-msgstr "密码字段已密文脱敏；加粗项表示经过 ACS SetParameterValues 或 LuCI 最后写入生效后的当前虚拟值。"
+msgstr "密码字段已隐藏；加粗项为经 ACS SetParameterValues 或 LuCI 修改后的当前虚拟值。"
 
 msgid "Parameter Path"
 msgstr "参数路径"
@@ -101,8 +101,8 @@ msgstr "当前虚拟值"
 msgid "Sanitized /tmp Ring Audit Log"
 msgstr "/tmp 内存环形脱敏审计日志"
 
-msgid "Stored exclusively in /tmp memory with automatic secret redaction; never written to NAND flash."
-msgstr "仅保存在 /tmp 内存中并自动脱敏密码与认证凭据，绝不写入 NAND 闪存。"
+msgid "Stored in /tmp memory ring buffer with automatic credential redaction."
+msgstr "保存在 /tmp 内存环形缓冲区，自动脱敏密码与认证凭据。"
 
 msgid "Clear /tmp Audit Log"
 msgstr "清空 /tmp 审计日志"
@@ -128,8 +128,8 @@ msgstr "启用 TR-069 伪装客户端"
 msgid "Sync Empty Fields from OMCI"
 msgstr "从 OMCI 自动补全留空字段"
 
-msgid "Read ME 134/136/340/347 exported defaults from airoha-pond; manually configured fields always take precedence."
-msgstr "从 airoha-pond 读取 OMCI ME 134/136/340/347 导出参数；任意手动填写的字段始终优先生效。"
+msgid "Read ME 134/136/340/347 exported defaults from airoha-pond; manually configured fields take precedence."
+msgstr "从 airoha-pond 读取 OMCI ME 134/136/340/347 导出参数；手动填写的字段优先生效。"
 
 msgid "PON Line"
 msgstr "PON 线路名称"
@@ -218,8 +218,8 @@ msgstr "周期性 Inform 间隔（秒）"
 msgid "Enable ConnectionRequest Listener"
 msgstr "启用反向连接（ConnectionRequest）监听"
 
-msgid "Binds strictly to the isolated tr069 interface IPv4/IPv6 addresses (never wildcard 0.0.0.0 or ::)."
-msgstr "仅严格绑定到隔离口 tr069 当前 IPv4/IPv6 地址，绝不监听通配地址 0.0.0.0 或 ::。"
+msgid "Binds to the isolated tr069 interface IPv4/IPv6 addresses."
+msgstr "绑定隔离接口 tr069 当前的 IPv4/IPv6 地址。"
 
 msgid "ConnectionRequest Port"
 msgstr "ConnectionRequest 端口"
@@ -269,8 +269,8 @@ msgstr "参数值"
 msgid "Virtual Firmware Download Mappings"
 msgstr "虚拟固件下载版本映射表"
 
-msgid "Virtual Download RPC matches URL substring and updates SoftwareVersion without downloading or flashing real firmware."
-msgstr "收到 ACS Download RPC 时仅按 URL 子串匹配更新虚拟 SoftwareVersion，绝不下载或刷写真实固件。"
+msgid "Matches the ACS Download RPC URL substring to update virtual SoftwareVersion and report TransferComplete."
+msgstr "收到 ACS Download RPC 时按 URL 子串匹配更新虚拟 SoftwareVersion 并上报 TransferComplete。"
 
 msgid "URL / Filename Match"
 msgstr "URL / 文件名匹配标识"
