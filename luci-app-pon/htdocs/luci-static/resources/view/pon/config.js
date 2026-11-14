@@ -522,7 +522,7 @@ return view.extend({
 					E('div', { 'class': 'cbi-value-field' },
 						storages.map(L.bind(function(storage) {
 							return E('button', {
-								'class': 'cbi-button cbi-button-neutral',
+								'class': 'cbi-button cbi-button-action',
 								'style': 'margin-right: 0.5em;',
 								'click': ui.createHandlerFn(this, 'handleBoardDataExport', storage)
 							}, [ _('Download %s').format(storage.id + '.bin') ]);
