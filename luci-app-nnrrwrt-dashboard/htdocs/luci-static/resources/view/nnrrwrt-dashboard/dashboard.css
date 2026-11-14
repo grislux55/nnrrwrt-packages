@@ -505,11 +505,44 @@
 }
 
 .nnrrwrt-port-rate {
+	margin-top: auto;
 	font-size: 0.7rem;
 	color: var(--nd-chassis-muted);
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
+}
+
+.nnrrwrt-port-rates {
+	margin-top: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 0.1rem;
+	font-size: 0.7rem;
+	line-height: 1.25;
+	color: var(--nd-chassis-text);
+}
+
+.nnrrwrt-port-rate-line {
+	display: flex;
+	align-items: center;
+	gap: 0.25rem;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.nnrrwrt-port-arrow {
+	font-weight: 600;
+	flex-shrink: 0;
+}
+
+.nnrrwrt-port-arrow.is-down {
+	color: var(--nd-rx);
+}
+
+.nnrrwrt-port-arrow.is-up {
+	color: var(--nd-tx);
 }
 
 /* Selected Port Inspector Bar */

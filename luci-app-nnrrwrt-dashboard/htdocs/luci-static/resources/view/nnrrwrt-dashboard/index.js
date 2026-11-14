@@ -209,6 +209,29 @@ function codeSpan(value, cls) {
 	}, value);
 }
 
+function resolvePortTraffic(port, rate) {
+	var p = port || {};
+	var r = rate || { rx_bps: 0, tx_bps: 0 };
+	if (p.role === 'optical') {
+		return {
+			down_bps: r.rx_bps,
+			up_bps: r.tx_bps,
+			down_bytes: p.rx_bytes,
+			up_bytes: p.tx_bytes,
+			down_tag: 'RX',
+			up_tag: 'TX'
+		};
+	}
+	return {
+		down_bps: r.tx_bps,
+		up_bps: r.rx_bps,
+		down_bytes: p.tx_bytes,
+		up_bytes: p.rx_bytes,
+		down_tag: 'TX',
+		up_tag: 'RX'
+	};
+}
+
 function pickSessionInterfaces(netDump) {
 	var list = Array.isArray(netDump && netDump.interface) ? netDump.interface : [];
 	var byName = {};
@@ -496,9 +519,20 @@ return view.extend({
 				}
 
 				var r = st.portRates[p.id] || { rx_bps: 0, tx_bps: 0 };
-				var rateText = isUp
-					? ('↓' + NBSP + formatBitrate(r.rx_bps))
-					: (p.max_mbps >= 2500 ? (fmtNum(p.max_mbps / 1000, 1, 0) + 'G') : '1G');
+				var tf = resolvePortTraffic(p, r);
+				var rateNode = isUp
+					? E('div', { 'class': 'nnrrwrt-port-rates', 'translate': 'no' }, [
+						E('div', { 'class': 'nnrrwrt-port-rate-line' }, [
+							E('span', { 'class': 'nnrrwrt-port-arrow is-down', 'aria-hidden': 'true' }, '↓'),
+							formatBitrate(tf.down_bps)
+						]),
+						E('div', { 'class': 'nnrrwrt-port-rate-line' }, [
+							E('span', { 'class': 'nnrrwrt-port-arrow is-up', 'aria-hidden': 'true' }, '↑'),
+							formatBitrate(tf.up_bps)
+						])
+					])
+					: E('div', { 'class': 'nnrrwrt-port-rate', 'translate': 'no' },
+						p.max_mbps >= 2500 ? (fmtNum(p.max_mbps / 1000, 1, 0) + 'G') : '1G');
 
 				return E('button', {
 					'type': 'button',
@@ -516,7 +550,7 @@ return view.extend({
 					]),
 					renderSocketGraphic(p.role),
 					E('div', { 'class': 'nnrrwrt-port-speed' }, speedText),
-					E('div', { 'class': 'nnrrwrt-port-rate' }, rateText)
+					rateNode
 				]);
 			}
 
@@ -616,6 +650,7 @@ return view.extend({
 
 		var p = slot.item;
 		var r = this._state.portRates[p.id] || { rx_bps: 0, tx_bps: 0 };
+		var tf = resolvePortTraffic(p, r);
 		var isOptical = p.role === 'optical';
 		var linkDesc = p.up ? formatLinkSpeed(p.speed_mbps) : _('Link down');
 		if (isOptical) {
@@ -634,8 +669,8 @@ return view.extend({
 				E('strong', { 'translate': 'no' }, p.label + ' (' + p.id + ')'),
 				E('span', {}, linkDesc),
 				p.mac ? codeSpan(p.mac.toUpperCase(), 'nnrrwrt-inspector-code') : null,
-				E('span', {}, 'RX ' + formatBitrate(r.rx_bps) + ' (' + formatBytes(p.rx_bytes) + ')'),
-				E('span', {}, 'TX ' + formatBitrate(r.tx_bps) + ' (' + formatBytes(p.tx_bytes) + ')')
+				E('span', { 'translate': 'no' }, '↓ ' + tf.down_tag + ' ' + formatBitrate(tf.down_bps) + ' (' + formatBytes(tf.down_bytes) + ')'),
+				E('span', { 'translate': 'no' }, '↑ ' + tf.up_tag + ' ' + formatBitrate(tf.up_bps) + ' (' + formatBytes(tf.up_bytes) + ')')
 			]),
 			E('a', { 'class': 'nnrrwrt-inspector-link', 'href': destUrl }, destText)
 		]);
@@ -735,6 +770,7 @@ return view.extend({
 		var sessions = st.latest.sessions || {};
 		var ports = (tel.chassis && Array.isArray(tel.chassis.ports)) ? tel.chassis.ports : [];
 		var dev = st.scopeDev || 'pon0';
+		var isOpticalScope = dev === 'pon0';
 		var portObj = ports.find(function(p) { return p.id === dev; }) || {};
 		var curRate = st.portRates[dev] || { rx_bps: 0, tx_bps: 0 };
 
@@ -807,7 +843,7 @@ return view.extend({
 						E('div', { 'class': 'nnrrwrt-rate-item' }, [
 							E('span', { 'class': 'nnrrwrt-rate-label' }, [
 								E('span', { 'class': 'nnrrwrt-swatch is-rx', 'aria-hidden': 'true' }),
-								_('Downstream')
+								isOpticalScope ? _('Downstream') : codeSpan('RX')
 							]),
 							E('span', { 'class': 'nnrrwrt-rate-val' }, formatBitrate(curRate.rx_bps)),
 							E('span', { 'class': 'nnrrwrt-rate-sub' }, _('Total') + ': ' + formatBytes(portObj.rx_bytes))
@@ -815,7 +851,7 @@ return view.extend({
 						E('div', { 'class': 'nnrrwrt-rate-item' }, [
 							E('span', { 'class': 'nnrrwrt-rate-label' }, [
 								E('span', { 'class': 'nnrrwrt-swatch is-tx', 'aria-hidden': 'true' }),
-								_('Upstream')
+								isOpticalScope ? _('Upstream') : codeSpan('TX')
 							]),
 							E('span', { 'class': 'nnrrwrt-rate-val' }, formatBitrate(curRate.tx_bps)),
 							E('span', { 'class': 'nnrrwrt-rate-sub' }, _('Total') + ': ' + formatBytes(portObj.tx_bytes))
