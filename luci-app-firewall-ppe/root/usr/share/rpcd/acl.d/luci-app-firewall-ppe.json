@@ -1,0 +1,11 @@
+{
+	"luci-app-firewall-ppe": {
+		"description": "Grant access to PPE binding thresholds",
+		"read": {
+			"uci": [ "airoha_accel" ]
+		},
+		"write": {
+			"uci": [ "airoha_accel" ]
+		}
+	}
+}

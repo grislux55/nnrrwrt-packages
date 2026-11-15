@@ -1,0 +1,14 @@
+{
+	"admin/network/firewall/ppe": {
+		"title": "PPE Binding",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "firewall/ppe"
+		},
+		"depends": {
+			"acl": [ "luci-app-firewall-ppe" ],
+			"uci": { "airoha_accel": true }
+		}
+	}
+}

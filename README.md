@@ -33,6 +33,7 @@ Userspace daemon, CLI utility, and LuCI web application feed for [NNRRWrt](https
 | Package / 软件包 | Version / 版本 | Directory / 目录 | Purpose / 职责说明 |
 | --- | --- | --- | --- |
 | `luci-app-iptv` | 0.1.0 | `luci-app-iptv/` | Dedicated `br-iptv` port bridge and `nftables` bridge forward isolation / IPTV 独立网桥与 `nftables` 桥接转发隔离配置应用 |
+| `luci-app-firewall-ppe` | 0.1.0 | `luci-app-firewall-ppe/` | PPE flow-binding switch and L2/L3 packet-rate thresholds under Network → Firewall / 防火墙设置中的 PPE 流绑定开关与 L2/L3 包速率门槛 |
 
 ## OpenWrt Feed Integration / Feed 接入方式
 

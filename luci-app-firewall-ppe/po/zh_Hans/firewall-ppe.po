@@ -1,0 +1,41 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-firewall-ppe\n"
+"PO-Revision-Date: 2026-11-16 12:00+0800\n"
+"Last-Translator: NNRRWrt Project\n"
+"Language: zh_Hans\n"
+"Language-Team: Chinese (Simplified)\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Binding thresholds"
+msgstr "绑定门槛"
+
+msgid "Grant access to PPE binding thresholds"
+msgstr "允许访问 PPE 绑定门槛"
+
+msgid "L2 bridge threshold (pps)"
+msgstr "L2 网桥门槛（pps）"
+
+msgid "L3 routing threshold (pps)"
+msgstr "L3 路由门槛（pps）"
+
+msgid "PPE Binding"
+msgstr "PPE 绑定"
+
+msgid "PPE sends a flow to hardware after its packet rate reaches the configured threshold. Lower values offload flows sooner; higher values keep short flows on the CPU."
+msgstr "一条流的包速率达到门槛后，PPE 会把它交给硬件处理。数值越低，流越快进入 PPE；数值越高，短连接会在 CPU 上停留更久。"
+
+msgid "Packet rate that moves a bridged flow from software processing to PPE."
+msgstr "网桥转发流量从软件处理进入 PPE 的包速率。"
+
+msgid "Packet rate that moves a routed or NAT flow from software processing to PPE."
+msgstr "路由或 NAT 流量从软件处理进入 PPE 的包速率。"
+
+msgid "Use custom thresholds"
+msgstr "使用自定义门槛"
+
+msgid "When disabled, the kernel uses the upstream 30 packets per second threshold for L2 and L3 flows."
+msgstr "关闭后，内核为 L2 和 L3 流量使用上游默认的每秒 30 个包。"
