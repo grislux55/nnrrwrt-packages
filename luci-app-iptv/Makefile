@@ -8,7 +8,7 @@ LUCI_DEPENDS:=+luci-base +firewall4 +kmod-nft-bridge
 LUCI_PKGARCH:=all
 
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0
 
 include $(TOPDIR)/feeds/luci/luci.mk

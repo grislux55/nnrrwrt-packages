@@ -284,21 +284,58 @@ write_firewall_config() {
 	uci commit firewall || fail "Cannot save firewall configuration"
 }
 
+bridge_of() {
+	local link
+
+	link="$(readlink "/sys/class/net/$1/brport/bridge" 2>/dev/null)" || return 1
+	echo "${link##*/}"
+}
+
+bridges_settled() {
+	if [ "$ENABLED" -eq 1 ]; then
+		[ "$(bridge_of "$LAN_PORT")" = "br-iptv" ] || return 1
+	else
+		[ ! -e /sys/class/net/br-iptv ] || return 1
+	fi
+
+	[ -n "$OLD_LAN_PORT" ] && [ -n "$BR_LAN_SECTION" ] || return 0
+	[ "$ENABLED" -eq 1 ] && [ "$OLD_LAN_PORT" = "$LAN_PORT" ] && return 0
+	[ -e "/sys/class/net/$OLD_LAN_PORT" ] || return 0
+	[ "$(bridge_of "$OLD_LAN_PORT")" = "br-lan" ]
+}
+
+wait_for_bridges() {
+	local tries=10
+
+	while ! bridges_settled; do
+		if [ "$tries" -le 0 ]; then
+			logger -t iptv "Bridge ports did not reach the IPTV layout within 10 seconds"
+			return 0
+		fi
+		tries=$((tries - 1))
+		sleep 1
+	done
+}
+
 reload_runtime() {
 	[ "$ACTION" = "boot" ] && return 0
 
 	if [ "$ENABLED" -eq 1 ]; then
 		# The bridge must be filtered from its first forwarded frame.
-		/etc/init.d/firewall reload || fail "firewall4 reload failed"
+		nft -f "$NFT_FILE" || fail "Cannot load IPTV filter table"
 		ubus call network reload >/dev/null || fail "netifd reload failed"
 	else
 		# The filter remains active throughout bridge teardown.
 		ubus call network reload >/dev/null || fail "netifd reload failed"
-		if nft list table bridge iptv >/dev/null 2>&1; then
-			nft delete table bridge iptv || fail "Cannot delete IPTV filter table"
-		fi
-		/etc/init.d/firewall reload || fail "firewall4 reload failed"
 	fi
+
+	# firewall4 reads bridge membership from sysfs when it builds flowtable fb.
+	wait_for_bridges
+
+	if [ "$ENABLED" -ne 1 ] && nft list table bridge iptv >/dev/null 2>&1; then
+		nft delete table bridge iptv || fail "Cannot delete IPTV filter table"
+	fi
+	/etc/init.d/firewall reload || fail "firewall4 reload failed"
 }
 
 load_iptv_config
