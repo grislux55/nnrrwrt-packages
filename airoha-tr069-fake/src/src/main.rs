@@ -26,6 +26,8 @@ use serde_json::json;
 
 const DEFAULT_CONFIG_PATH: &str = "/tmp/tr069-fake-runtime.json";
 const DEFAULT_CONTROL_SOCK: &str = "/var/run/airoha-tr069-fake.sock";
+const STARTUP_RETRY_SECS: u64 = 15;
+const DAD_HOLD_SECS: u64 = 10;
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
@@ -275,14 +277,21 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+fn effective_cfg(base: &FakeConfig, model: &VirtualModel) -> FakeConfig {
+    let mut cfg = base.clone();
+    apply_effects_to_config(&mut cfg, &model.current_management_effects(), None);
+    cfg
+}
+
 fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
-    let (mut cfg, mut model) = match load_effective_cfg_and_model(config_path) {
+    let (mut base_cfg, mut model) = match load_raw_cfg_and_model(config_path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("startup error: {e}");
             return 1;
         }
     };
+    let mut cfg = effective_cfg(&base_cfg, &model);
     let audit = open_audit(&cfg);
     audit.record(
         "INFO",
@@ -318,6 +327,7 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
 
     let mut startup_inform_pending = true;
     let mut last_startup_attempt: Option<Instant> = None;
+    let daemon_started = Instant::now();
     let mut last_inform = Instant::now();
     let mut last_poll_check = Instant::now();
     let mut last_cfg_mtime = file_mtime(config_path);
@@ -334,11 +344,13 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
             let cur_cfg_mtime = file_mtime(config_path);
             if cur_cfg_mtime != last_cfg_mtime {
                 last_cfg_mtime = cur_cfg_mtime;
-                if let Ok((fresh_cfg, fresh_model)) = load_effective_cfg_and_model(config_path) {
+                if let Ok((fresh_base, fresh_model)) = load_raw_cfg_and_model(config_path) {
+                    let fresh_cfg = effective_cfg(&fresh_base, &fresh_model);
                     let conn_changed = fresh_cfg.conn_req_enable != cfg.conn_req_enable
                         || fresh_cfg.conn_req_port != cfg.conn_req_port
                         || fresh_cfg.conn_req_path != cfg.conn_req_path
                         || fresh_cfg.tr069_ifname != cfg.tr069_ifname;
+                    base_cfg = fresh_base;
                     cfg = fresh_cfg;
                     model = fresh_model;
                     {
@@ -360,7 +372,7 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                 let cur_model_mtime = file_mtime(&model_json_path);
                 let cur_pending_mtime = file_mtime(&pending_json_path);
                 if cur_model_mtime != last_model_mtime || cur_pending_mtime != last_pending_mtime {
-                    if let Ok(fresh_model) = VirtualModel::load_or_init(&cfg) {
+                    if let Ok(fresh_model) = VirtualModel::load_or_init(&base_cfg) {
                         model = fresh_model;
                         apply_effects_to_config(&mut cfg, &model.current_management_effects(), Some(&conn_creds));
                         state_changed = true;
@@ -391,16 +403,19 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
         }
 
         let manual_or_cr = trigger_inform.swap(false, Ordering::SeqCst);
+        let dad_hold = !active_rt.ipv6_tentative.is_empty()
+            && daemon_started.elapsed() < Duration::from_secs(DAD_HOLD_SECS);
         let startup_due = startup_inform_pending
+            && !dad_hold
             && last_startup_attempt
-                .map(|t| t.elapsed() >= Duration::from_secs(15))
+                .map(|t| t.elapsed() >= Duration::from_secs(STARTUP_RETRY_SECS))
                 .unwrap_or(true);
         let periodic_due = !startup_inform_pending
             && cfg.periodic_inform_enable
             && last_inform.elapsed() >= Duration::from_secs(cfg.periodic_inform_interval);
 
         if manual_or_cr || startup_due || periodic_due {
-            if let Ok(fresh_model) = VirtualModel::load_or_init(&cfg) {
+            if let Ok(fresh_model) = VirtualModel::load_or_init(&base_cfg) {
                 model = fresh_model;
                 apply_effects_to_config(&mut cfg, &model.current_management_effects(), Some(&conn_creds));
             }
@@ -412,6 +427,11 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                 }
                 conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &trigger_inform, &audit);
             }
+            let boot_queued = model
+                .pending
+                .events
+                .iter()
+                .any(|e| e.event_code == "1 BOOT" || e.event_code == "0 BOOTSTRAP");
             let ev = if manual_or_cr {
                 Some("6 CONNECTION REQUEST")
             } else if startup_due {
@@ -426,7 +446,7 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
             match run_cwmp_session(&mut cfg, &mut model, &active_rt, ev, &audit, Some(&conn_creds))
             {
                 Ok(summary) => {
-                    if startup_due {
+                    if startup_due || boot_queued {
                         startup_inform_pending = false;
                         last_startup_attempt = None;
                     }
@@ -439,6 +459,15 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                             summary.rpcs_handled, summary.virtual_reboot_requested
                         ),
                     );
+                    if summary.virtual_reboot_requested {
+                        startup_inform_pending = true;
+                        last_startup_attempt = Some(Instant::now());
+                        audit.record(
+                            "INFO",
+                            "cwmp",
+                            &format!("Virtual reboot: boot Inform in {STARTUP_RETRY_SECS} s"),
+                        );
+                    }
                 }
                 Err(e) => {
                     if startup_due {

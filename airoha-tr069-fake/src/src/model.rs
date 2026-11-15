@@ -669,6 +669,12 @@ impl VirtualModel {
 
     pub fn handle_factory_reset(&mut self) -> Result<(), CwmpFault> {
         self.reset_virtual()
+            .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
+        self.pending.events.push(PendingEvent {
+            event_code: "1 BOOT".to_owned(),
+            command_key: String::new(),
+        });
+        self.save_pending()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))
     }
 

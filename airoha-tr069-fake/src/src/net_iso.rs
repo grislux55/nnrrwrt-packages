@@ -19,6 +19,7 @@ pub struct InterfaceRuntime {
     pub ifname: String,
     pub ipv4_addrs: Vec<Ipv4Addr>,
     pub ipv6_addrs: Vec<Ipv6Addr>,
+    pub ipv6_tentative: Vec<Ipv6Addr>,
     pub dns_servers: Vec<IpAddr>,
 }
 
@@ -32,7 +33,7 @@ impl InterfaceRuntime {
             return rt;
         }
         rt.ipv4_addrs = read_ip_addrs_v4(ifname);
-        rt.ipv6_addrs = read_ip_addrs_v6(ifname);
+        (rt.ipv6_addrs, rt.ipv6_tentative) = read_ip_addrs_v6(ifname);
         rt.dns_servers = read_ubus_dns("tr069");
         for dns in read_ubus_dns("tr069_6") {
             if !rt.dns_servers.contains(&dns) {
@@ -89,31 +90,44 @@ fn read_ip_addrs_v4(ifname: &str) -> Vec<Ipv4Addr> {
     res
 }
 
-fn read_ip_addrs_v6(ifname: &str) -> Vec<Ipv6Addr> {
+fn read_ip_addrs_v6(ifname: &str) -> (Vec<Ipv6Addr>, Vec<Ipv6Addr>) {
     let Ok(out) = Command::new("ip")
         .args(["-6", "-o", "addr", "show", "dev", ifname, "scope", "global"])
         .output()
     else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if !out.status.success() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut res = Vec::new();
+    parse_ip_addrs_v6(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Splits `ip -6 -o addr show` output into usable and DAD-tentative addresses and drops dadfailed ones.
+pub fn parse_ip_addrs_v6(text: &str) -> (Vec<Ipv6Addr>, Vec<Ipv6Addr>) {
+    let mut usable = Vec::new();
+    let mut tentative = Vec::new();
     for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.contains(&"dadfailed") {
+            continue;
+        }
+        let dst = if parts.contains(&"tentative") {
+            &mut tentative
+        } else {
+            &mut usable
+        };
         for win in parts.windows(2) {
             if win[0] == "inet6" {
                 if let Some(ip_str) = win[1].split('/').next() {
                     if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
-                        res.push(ip);
+                        dst.push(ip);
                     }
                 }
             }
         }
     }
-    res
+    (usable, tentative)
 }
 
 fn read_ubus_dns(iface: &str) -> Vec<IpAddr> {
@@ -710,6 +724,7 @@ mod tests {
             ifname: "eth0.46".to_owned(),
             ipv4_addrs: Vec::new(),
             ipv6_addrs: vec!["2001:db8::10".parse().unwrap()],
+            ipv6_tentative: Vec::new(),
             dns_servers: vec!["fe80::1".parse().unwrap()],
         };
         let (bind, dest) =
@@ -733,6 +748,7 @@ mod tests {
                 "2001:db8::10".parse().unwrap(),
                 "fe80::2".parse().unwrap(),
             ],
+            ipv6_tentative: Vec::new(),
             dns_servers: Vec::new(),
         };
         let (bind, dest) =
@@ -753,10 +769,30 @@ mod tests {
             ifname: String::new(),
             ipv4_addrs: Vec::new(),
             ipv6_addrs: Vec::new(),
+            ipv6_tentative: Vec::new(),
             dns_servers: Vec::new(),
         };
         let err = dns_udp_endpoints("fe80::1".parse().unwrap(), &rt, None)
             .expect_err("missing interface should fail");
         assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[test]
+    fn ipv6_parser_separates_tentative_and_drops_dadfailed() {
+        let out = concat!(
+            "7: tr069-if    inet6 fd00:46::2/64 scope global tentative \\       valid_lft forever preferred_lft forever\n",
+            "7: tr069-if    inet6 2001:db8:46::2/64 scope global \\       valid_lft forever preferred_lft forever\n",
+            "7: tr069-if    inet6 2001:db8:46::3/64 scope global tentative dadfailed \\       valid_lft forever preferred_lft forever\n",
+            "7: tr069-if    inet6 2001:db8:46::4/64 scope global deprecated noprefixroute \\       valid_lft forever preferred_lft 0sec\n",
+        );
+        let (usable, tentative) = parse_ip_addrs_v6(out);
+        assert_eq!(
+            usable,
+            vec![
+                "2001:db8:46::2".parse::<Ipv6Addr>().unwrap(),
+                "2001:db8:46::4".parse::<Ipv6Addr>().unwrap(),
+            ]
+        );
+        assert_eq!(tentative, vec!["fd00:46::2".parse::<Ipv6Addr>().unwrap()]);
     }
 }

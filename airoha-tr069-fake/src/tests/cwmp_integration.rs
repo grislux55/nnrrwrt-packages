@@ -282,6 +282,38 @@ fn test_connection_request_rejects_wildcard_and_verifies_digest() {
 }
 
 #[test]
+fn test_connection_request_failed_bind_releases_bound_listeners() {
+    let audit = AuditLogger::new("/tmp/tr069-fake-cr-bind-test.log");
+    let creds = Arc::new(Mutex::new(ConnReqCreds {
+        path: "/tr069".to_owned(),
+        username: "cruser".to_owned(),
+        password: "crpass".to_owned(),
+    }));
+    let trig = Arc::new(AtomicBool::new(false));
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    // 192.0.2.1 (TEST-NET-1) is not assigned locally, so bind() fails with EADDRNOTAVAIL.
+    let foreign = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port);
+
+    assert!(ConnectionRequestServer::start(
+        &[local, foreign],
+        Arc::clone(&creds),
+        Arc::clone(&trig),
+        audit.clone()
+    )
+    .is_err());
+    let srv = ConnectionRequestServer::start(&[local], creds, trig, audit)
+        .expect("a failed start must release the listeners it already bound");
+    assert_eq!(srv.bound_addrs, vec![local]);
+    srv.stop();
+    let _ = fs::remove_file("/tmp/tr069-fake-cr-bind-test.log");
+}
+
+#[test]
 fn test_end_to_end_cwmp_session_with_mock_acs_digest_and_cookies() {
     let dir = temp_dir("e2e");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -409,6 +441,7 @@ fn test_dns_packet_and_hashes_and_ipv6_bind_addrs() {
             "fe80::1".parse().unwrap(),
             "2001:db8::40".parse().unwrap(),
         ],
+        ipv6_tentative: vec![],
         dns_servers: vec![],
     };
     let binds = rt.conn_req_bind_addrs(7547);
@@ -478,11 +511,15 @@ fn test_cwmp_rpcs_names_attributes_factory_reset_and_effects() {
         model.get_value("InternetGatewayDevice.DeviceInfo.ProvisioningCode"),
         Some("")
     );
-    assert!(model
+    let codes: Vec<&str> = model
         .pending
         .events
         .iter()
-        .any(|e| e.event_code == "0 BOOTSTRAP"));
+        .map(|e| e.event_code.as_str())
+        .collect();
+    assert_eq!(codes, vec!["0 BOOTSTRAP", "1 BOOT"]);
+    let reloaded = VirtualModel::load_or_init(&cfg).unwrap();
+    assert_eq!(reloaded.pending.events.len(), 2);
 
     let _ = fs::remove_dir_all(&dir);
 }

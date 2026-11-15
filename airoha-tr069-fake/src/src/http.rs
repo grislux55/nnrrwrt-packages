@@ -816,11 +816,14 @@ impl ConnectionRequestServer {
         let mut handles = Vec::new();
         let realm = "NNRRWrt-TR069".to_owned();
         let nonce_tracker = Arc::new(Mutex::new(NonceTracker::default()));
+        let mut listeners = Vec::with_capacity(bind_addrs.len());
         for addr in bind_addrs {
             let listener = TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
-            let local = listener.local_addr()?;
-            bound_addrs.push(local);
+            bound_addrs.push(listener.local_addr()?);
+            listeners.push(listener);
+        }
+        for listener in listeners {
             let stop_c = Arc::clone(&stop);
             let creds_c = Arc::clone(&creds);
             let trig_c = Arc::clone(&trigger_flag);
