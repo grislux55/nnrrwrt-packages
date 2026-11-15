@@ -10,7 +10,7 @@ Userspace daemon, CLI utility, and LuCI web application feed for [NNRRWrt](https
 
 | Package / 软件包 | Version / 版本 | Directory / 目录 | Purpose / 职责说明 |
 | --- | --- | --- | --- |
-| `luci-app-nnrrwrt-dashboard` | 0.1.0 | `luci-app-nnrrwrt-dashboard/` | Real-time optical gateway dashboard (`admin/dashboard`): physical port & 10-LED panel, dual optical power & WAN/LAN traffic scopes, PPE hardware offload & thermal/system telemetry / 实时光猫网关总览仪表盘（端口与 10 颗 LED 面板、双光强与流量示波器、PPE 硬件卸载与温控指标） |
+| `luci-app-nnrrwrt-dashboard` | 0.1.0 | `luci-app-nnrrwrt-dashboard/` | Real-time optical gateway dashboard (`admin/dashboard`): physical port & 10-LED panel, dual optical power & WAN/LAN traffic charts, PPE hardware offload & thermal/system telemetry / 实时光猫网关总览仪表盘（端口与 10 颗 LED 面板、双光强与流量曲线、PPE 硬件卸载与温控指标） |
 
 ### 2. PON Control, Protocol Agent & Board Backup / PON 控制、协议代理与板级备份
 
