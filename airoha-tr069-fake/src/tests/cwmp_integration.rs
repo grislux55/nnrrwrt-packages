@@ -524,6 +524,102 @@ fn test_cwmp_rpcs_names_attributes_factory_reset_and_effects() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn inform_response_http() -> String {
+    let body = r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Body><cwmp:InformResponse><MaxEnvelopes>1</MaxEnvelopes></cwmp:InformResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+}
+
+fn acs_request_http(cwmp_id: &str, rpc_xml: &str) -> String {
+    let body = format!(
+        r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Header><cwmp:ID>{cwmp_id}</cwmp:ID></SOAP-ENV:Header><SOAP-ENV:Body>{rpc_xml}</SOAP-ENV:Body></SOAP-ENV:Envelope>"#
+    );
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+}
+
+#[test]
+fn test_session_has_no_rpc_cap_and_faults_unsupported_methods() {
+    let dir = temp_dir("nocap");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let srv = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (_, inform) = read_http_request(&mut stream).unwrap();
+        assert!(inform.contains("<cwmp:Inform>"));
+        stream.write_all(inform_response_http().as_bytes()).unwrap();
+        let (_, empty) = read_http_request(&mut stream).unwrap();
+        assert!(empty.is_empty());
+        for i in 0..40 {
+            let id = format!("r{i}");
+            stream
+                .write_all(acs_request_http(&id, "<cwmp:GetRPCMethods/>").as_bytes())
+                .unwrap();
+            let (_, reply) = read_http_request(&mut stream).unwrap();
+            assert!(reply.contains("GetRPCMethodsResponse"), "reply {i}: {reply}");
+            assert!(reply.contains(&format!(">{id}</cwmp:ID>")), "reply {i}: {reply}");
+        }
+        let upload = "<cwmp:Upload><CommandKey>k</CommandKey><FileType>1 Vendor Configuration File</FileType><URL>http://192.0.2.1/up</URL></cwmp:Upload>";
+        stream
+            .write_all(acs_request_http("up-1", upload).as_bytes())
+            .unwrap();
+        let (_, fault) = read_http_request(&mut stream).unwrap();
+        assert!(fault.contains("<FaultCode>9000</FaultCode>"), "{fault}");
+        assert!(fault.contains(">up-1</cwmp:ID>"), "{fault}");
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = format!("http://{addr}/acs");
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let rt = InterfaceRuntime::default();
+    let audit = AuditLogger::new(dir.join("audit.log"));
+
+    let summary = run_cwmp_session(&mut cfg, &mut model, &rt, None, &audit, None).unwrap();
+    assert_eq!(summary.rpcs_handled, 41);
+    srv.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_session_ends_after_repeated_malformed_soap() {
+    let dir = temp_dir("malformed");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let srv = std::thread::spawn(move || {
+        let garbage = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n<notxml";
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_http_request(&mut stream).unwrap();
+        stream.write_all(inform_response_http().as_bytes()).unwrap();
+        let (_, empty) = read_http_request(&mut stream).unwrap();
+        assert!(empty.is_empty());
+        for _ in 0..2 {
+            stream.write_all(garbage.as_bytes()).unwrap();
+            let (_, fault) = read_http_request(&mut stream).unwrap();
+            assert!(fault.contains("<FaultCode>9003</FaultCode>"), "{fault}");
+        }
+        stream.write_all(garbage.as_bytes()).unwrap();
+        assert!(read_http_request(&mut stream).is_none());
+    });
+
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = format!("http://{addr}/acs");
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let rt = InterfaceRuntime::default();
+    let audit = AuditLogger::new(dir.join("audit.log"));
+
+    let err = run_cwmp_session(&mut cfg, &mut model, &rt, None, &audit, None).unwrap_err();
+    assert!(err.to_string().contains("malformed SOAP"), "unexpected err: {err}");
+    srv.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_format_unix_timestamp_iso8601_utc() {
     assert_eq!(format_unix_timestamp(0), "1970-01-01T00:00:00Z");

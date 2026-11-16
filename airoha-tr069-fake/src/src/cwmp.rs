@@ -57,6 +57,10 @@ pub enum CwmpMessage {
         code: String,
         message: String,
     },
+    /// Any other element in the SOAP body, named by its local tag.
+    Unsupported {
+        method: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -462,6 +466,13 @@ pub fn dispatch_rpc(
             Err(f) => build_fault(id, &f),
         },
         CwmpMessage::Fault { .. } => return (None, effects, false),
+        CwmpMessage::Unsupported { method } => {
+            // A fault answers requests only: an unexpected response gets no reply.
+            if method.ends_with("Response") {
+                return (None, effects, false);
+            }
+            build_fault(id, &CwmpFault::simple(9000, "Method not supported"))
+        }
     };
     (Some(xml), effects, virtual_reboot)
 }
@@ -688,7 +699,9 @@ fn extract_cwmp_envelope(doc: &Document<'_>) -> Result<ParsedEnvelope, String> {
             code: child_text_trimmed(rpc, "faultcode").unwrap_or_else(|| "Fault".to_owned()),
             message: child_text_trimmed(rpc, "faultstring").unwrap_or_default(),
         },
-        other => return Err(format!("unsupported CWMP RPC method: {other}")),
+        other => CwmpMessage::Unsupported {
+            method: other.to_owned(),
+        },
     };
     Ok(ParsedEnvelope {
         cwmp_id,

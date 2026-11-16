@@ -17,11 +17,17 @@ use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 use audit::AuditLogger;
 use config::FakeConfig;
-use cwmp::{build_fault, build_inform, build_transfer_complete, dispatch_rpc, parse_cwmp_envelope};
+use cwmp::{
+    build_fault, build_inform, build_transfer_complete, dispatch_rpc, parse_cwmp_envelope,
+    CwmpMessage,
+};
 use http::{AcsHttpClient, ConnReqCreds};
 pub use model::dump_sanitized_model_json;
 use model::{CwmpFault, ManagementEffects, PendingEvent, VirtualModel};
 use net_iso::InterfaceRuntime;
+
+/// Consecutive unparsable ACS replies after which a session is abandoned.
+const MAX_MALFORMED_REPLIES: u32 = 3;
 
 pub fn load_raw_cfg_and_model(config_path: &Path) -> Result<(FakeConfig, VirtualModel), String> {
     let cfg = if config_path.exists() {
@@ -258,7 +264,9 @@ pub fn run_cwmp_session(
 
     let mut summary = SessionSummary::default();
     let mut next_body = String::new();
-    for _ in 0..32 {
+    let mut malformed_replies = 0u32;
+    // The ACS ends the session with 204 or an empty body; the number of RPCs is its choice.
+    loop {
         let acs_resp = client.post_cwmp(&next_body, None)?;
         if acs_resp.status == 204
             || ((200..300).contains(&acs_resp.status) && acs_resp.body.is_empty())
@@ -277,10 +285,24 @@ pub fn run_cwmp_session(
             Ok(e) => e,
             Err(err) => {
                 audit.record("WARN", "cwmp", &format!("Malformed ACS SOAP XML: {err}"));
+                malformed_replies += 1;
+                if malformed_replies >= MAX_MALFORMED_REPLIES {
+                    return Err(io::Error::other(format!(
+                        "ACS sent {malformed_replies} malformed SOAP replies in a row"
+                    )));
+                }
                 next_body = build_fault(None, &CwmpFault::simple(9003, err));
                 continue;
             }
         };
+        malformed_replies = 0;
+        if let CwmpMessage::Unsupported { method } = &env.message {
+            audit.record(
+                "WARN",
+                "cwmp",
+                &format!("ACS sent unsupported CWMP element {method}"),
+            );
+        }
         summary.rpcs_handled += 1;
         let (reply_opt, eff, reboot_req) = dispatch_rpc(&env, model, cfg);
         apply_effects_to_config(cfg, &eff, conn_creds);
