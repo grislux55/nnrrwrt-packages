@@ -256,7 +256,8 @@ fn test_connection_request_rejects_wildcard_and_verifies_digest() {
     s1.write_all(b"GET /tr069 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
     let mut r1 = String::new();
     s1.read_to_string(&mut r1).unwrap();
-    assert!(r1.starts_with("HTTP/1.1 401"));
+    assert!(r1.starts_with("HTTP/1.1 401 Authorization Required\r\n"), "{r1}");
+    assert!(r1.contains("\r\nServer: TR069 client TCP connection request Server\r\n"), "{r1}");
     assert!(!trig.load(Ordering::SeqCst));
 
     let www_auth = r1
@@ -268,6 +269,14 @@ fn test_connection_request_rejects_wildcard_and_verifies_digest() {
         .1
         .trim();
     let chal = parse_digest_challenge(www_auth).unwrap();
+    // The challenge of the stock server: no qop, the path as domain.
+    assert_eq!(
+        www_auth,
+        format!(
+            "Digest realm=\"TR069 Client\", nonce=\"{}\", algorithm=\"MD5\", domain=\"/tr069\"",
+            chal.nonce
+        )
+    );
     let auth_hdr = build_digest_authorization("cruser", "crpass", "GET", "/tr069", &chal, 1, "abcdef01");
 
     // Authenticated GET -> 200 OK & sets trigger
@@ -276,10 +285,126 @@ fn test_connection_request_rejects_wildcard_and_verifies_digest() {
     s2.write_all(req2.as_bytes()).unwrap();
     let mut r2 = String::new();
     s2.read_to_string(&mut r2).unwrap();
-    assert!(r2.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(
+        r2,
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nServer: TR069 client TCP connection request Server\r\nConnection: close\r\n\r\n"
+    );
     assert!(trig.load(Ordering::SeqCst));
     srv.stop();
     let _ = fs::remove_file("/tmp/tr069-fake-cr-test.log");
+}
+
+/// The Digest challenge of a 401 response.
+fn digest_challenge_of(response: &str) -> airoha_tr069_fake::http::DigestChallenge {
+    let value = response
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("www-authenticate:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim())
+        .expect("no WWW-Authenticate header");
+    parse_digest_challenge(value).expect("unparsable Digest challenge")
+}
+
+/// Reads one response without a body, up to its blank line.
+fn read_http_response_head(stream: &mut std::net::TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut b = [0u8; 1];
+    while !raw.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut b) {
+            Ok(1) => raw.push(b[0]),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+#[test]
+fn test_connection_request_answers_the_retry_on_the_same_connection() {
+    let dir = temp_dir("cr_same_conn");
+    let audit = AuditLogger::new(dir.join("audit.log"));
+    let creds = Arc::new(Mutex::new(ConnReqCreds {
+        path: "/tr069".to_owned(),
+        username: "cruser".to_owned(),
+        password: "crpass".to_owned(),
+    }));
+    let trig = Arc::new(AtomicBool::new(false));
+    let srv = ConnectionRequestServer::start(
+        &["127.0.0.1:0".parse().unwrap()],
+        creds,
+        Arc::clone(&trig),
+        audit,
+    )
+    .unwrap();
+
+    // The stock server keeps the connection after its challenge and closes it after
+    // the 200.
+    let mut s = std::net::TcpStream::connect(srv.bound_addrs[0]).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /tr069 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    let challenge = read_http_response_head(&mut s);
+    assert!(challenge.starts_with("HTTP/1.1 401 Authorization Required\r\n"), "{challenge}");
+    assert!(!challenge.to_ascii_lowercase().contains("\r\nconnection:"), "{challenge}");
+    assert!(!trig.load(Ordering::SeqCst));
+
+    let auth_hdr = build_digest_authorization(
+        "cruser",
+        "crpass",
+        "GET",
+        "/tr069",
+        &digest_challenge_of(&challenge),
+        1,
+        "abcdef01",
+    );
+    s.write_all(format!("GET /tr069 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_hdr}\r\n\r\n").as_bytes()).unwrap();
+    let mut rest = String::new();
+    s.read_to_string(&mut rest).unwrap();
+    assert!(rest.starts_with("HTTP/1.1 200 OK\r\n"), "{rest}");
+    assert!(rest.contains("\r\nConnection: close\r\n"), "{rest}");
+    assert!(trig.load(Ordering::SeqCst));
+    srv.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_replies_have_the_stock_envelope_layout() {
+    let dir = temp_dir("stock_layout");
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let mut reply = |cwmp_id: &str, rpc_xml: &str| {
+        let request = format!(
+            r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Header><cwmp:ID>{cwmp_id}</cwmp:ID></SOAP-ENV:Header><SOAP-ENV:Body>{rpc_xml}</SOAP-ENV:Body></SOAP-ENV:Envelope>"#
+        );
+        let env = parse_cwmp_envelope(&request).unwrap();
+        dispatch_rpc(&env, &mut model, &cfg).0.unwrap()
+    };
+    let head = |cwmp_id: &str| {
+        format!(
+            "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:SOAP-ENC=\"http://schemas.xmlsoap.org/soap/encoding\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:cwmp=\"urn:dslforum-org:cwmp-1-0\">\n<SOAP-ENV:Header>\n<cwmp:ID SOAP-ENV:mustUnderstand=\"1\">{cwmp_id}</cwmp:ID>\n</SOAP-ENV:Header>\n<SOAP-ENV:Body>\n"
+        )
+    };
+    const TAIL: &str = "</SOAP-ENV:Body>\n</SOAP-ENV:Envelope>\n";
+
+    // No XML declaration, one tag per line, a reply without content as two tags.
+    assert_eq!(
+        reply("r1", "<cwmp:Reboot><CommandKey>k1</CommandKey></cwmp:Reboot>"),
+        format!("{}<cwmp:RebootResponse>\n</cwmp:RebootResponse>\n{TAIL}", head("r1"))
+    );
+    assert_eq!(
+        reply("f1", "<cwmp:Upload/>"),
+        format!(
+            "{}<SOAP-ENV:Fault>\n<faultcode>Client</faultcode>\n<faultstring>CWMP fault</faultstring>\n<detail>\n<cwmp:Fault>\n<FaultCode>9000</FaultCode>\n<FaultString>Method not supported</FaultString>\n</cwmp:Fault>\n</detail>\n</SOAP-ENV:Fault>\n{TAIL}",
+            head("f1")
+        )
+    );
+
+    // Arrays carry xsi:type ahead of the arrayType.
+    let methods = reply("m1", "<cwmp:GetRPCMethods/>");
+    assert!(methods.contains("<cwmp:GetRPCMethodsResponse>\n<MethodList xsi:type=\"SOAP-ENC:Array\" SOAP-ENC:arrayType=\"cwmp:string["), "{methods}");
+    let attrs = reply("a1", "<cwmp:GetParameterAttributes><ParameterNames><string>InternetGatewayDevice.DeviceInfo.SoftwareVersion</string></ParameterNames></cwmp:GetParameterAttributes>");
+    assert!(attrs.contains("<ParameterList xsi:type=\"SOAP-ENC:Array\" SOAP-ENC:arrayType=\"cwmp:ParameterAttributeStruct[1]\">\n<ParameterAttributeStruct>\n<Name>InternetGatewayDevice.DeviceInfo.SoftwareVersion</Name>\n<Notification>"), "{attrs}");
+    assert!(attrs.contains("</Notification>\n<AccessList xsi:type=\"SOAP-ENC:Array\" SOAP-ENC:arrayType=\"cwmp:String["), "{attrs}");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -339,18 +464,35 @@ fn test_end_to_end_cwmp_session_with_mock_acs_digest_and_cookies() {
                 if step == 0 {
                     assert!(req_body.contains("<cwmp:Inform>"));
                     let body = r#"<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Header><cwmp:ID>1</cwmp:ID></SOAP-ENV:Header><SOAP-ENV:Body><cwmp:InformResponse><MaxEnvelopes>1</MaxEnvelopes></cwmp:InformResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
+                    // Request headers and envelope layout of the stock client.
+                    assert!(req_hdrs.contains(&format!("\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: TR069 Client 1.0\r\nContent-Type: text/xml; charset=utf-8\r\nAuthorization: Digest ")), "{req_hdrs}");
+                    assert!(req_hdrs.ends_with(&format!("\r\nSOAPAction: Inform\r\nContent-Length: {}\r\n\r\n", req_body.len())), "{req_hdrs}");
+                    assert!(!req_hdrs.to_ascii_lowercase().contains("\r\nconnection:"), "{req_hdrs}");
+                    assert!(req_body.starts_with("<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:SOAP-ENC=\"http://schemas.xmlsoap.org/soap/encoding\" xmlns:xsd="), "{req_body}");
+                    assert!(req_body.contains("<Event xsi:type=\"SOAP-ENC:Array\" SOAP-ENC:arrayType=\"cwmp:EventStruct[1]\">\n<EventStruct>\n<EventCode>0 BOOTSTRAP</EventCode>\n<CommandKey></CommandKey>\n</EventStruct>\n</Event>\n<MaxEnvelopes>1</MaxEnvelopes>\n"), "{req_body}");
+                    assert!(req_body.ends_with("</ParameterList>\n</cwmp:Inform>\n</SOAP-ENV:Body>\n</SOAP-ENV:Envelope>\n"), "{req_body}");
+                    // One random decimal cwmp:ID of at most 31 bits per session.
+                    let session_id = req_body
+                        .split_once("<cwmp:ID SOAP-ENV:mustUnderstand=\"1\">")
+                        .and_then(|(_, rest)| rest.split_once("</cwmp:ID>"))
+                        .map(|(id, _)| id.to_owned())
+                        .unwrap();
+                    assert!(session_id.parse::<u32>().is_ok_and(|n| n <= i32::MAX as u32), "{session_id}");
                     let resp = format!("HTTP/1.1 200 OK\r\nSet-Cookie: JSESSIONID=cwmp-cookie-1; Path=/\r\nContent-Length: {}\r\n\r\n{body}", body.len());
                     stream.write_all(resp.as_bytes()).unwrap();
                     step = 1;
                 } else if step == 1 {
                     assert!(req_hdrs.contains("Cookie: JSESSIONID=cwmp-cookie-1"));
                     assert!(req_body.is_empty());
+                    assert!(req_hdrs.ends_with("\r\nContent-Type: text/xml\r\nContent-Length: 0\r\n\r\n"), "{req_hdrs}");
+                    assert!(!req_hdrs.contains("SOAPAction"), "{req_hdrs}");
                     let body = r#"<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Header><cwmp:ID>99</cwmp:ID></SOAP-ENV:Header><SOAP-ENV:Body><cwmp:SetParameterValues><ParameterList><ParameterValueStruct><Name>InternetGatewayDevice.ManagementServer.PeriodicInformInterval</Name><Value>300</Value></ParameterValueStruct></ParameterList><ParameterKey>acs-k1</ParameterKey></cwmp:SetParameterValues></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
                     let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
                     stream.write_all(resp.as_bytes()).unwrap();
                     step = 2;
                 } else if step == 2 {
-                    assert!(req_body.contains("SetParameterValuesResponse"));
+                    assert!(req_hdrs.contains("\r\nSOAPAction: \r\n"), "{req_hdrs}");
+                    assert!(req_body.contains("<cwmp:ID SOAP-ENV:mustUnderstand=\"1\">99</cwmp:ID>\n</SOAP-ENV:Header>\n<SOAP-ENV:Body>\n<cwmp:SetParameterValuesResponse>\n<Status>0</Status>\n</cwmp:SetParameterValuesResponse>\n</SOAP-ENV:Body>\n</SOAP-ENV:Envelope>\n"), "{req_body}");
                     stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
                     break;
                 }
@@ -888,7 +1030,7 @@ fn test_conn_req_digest_nonce_replay_protection() {
 
     // 1. Unauthenticated request returns 401 with server-issued nonce
     let mut s1 = TcpStream::connect(addr).unwrap();
-    s1.write_all(b"GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    s1.write_all(b"GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
     let mut buf = String::new();
     s1.read_to_string(&mut buf).unwrap();
     assert!(buf.starts_with("HTTP/1.1 401"), "expected 401, got: {buf}");
@@ -897,14 +1039,18 @@ fn test_conn_req_digest_nonce_replay_protection() {
         .find(|l| l.to_ascii_lowercase().starts_with("www-authenticate:"))
         .unwrap()
         .split_once(':').unwrap().1.trim();
-    let chal = parse_digest_challenge(chal_line).unwrap();
+    let mut chal = parse_digest_challenge(chal_line).unwrap();
+    // The challenge offers no qop. A response with qop=auth is still accepted and has
+    // its nc tracked, which steps 3 to 5 rely on.
+    assert!(chal.qop.is_none());
+    chal.qop = Some("auth".to_owned());
 
     // 2. Forged unissued nonce is rejected
     let mut forged_chal = chal.clone();
     forged_chal.nonce = "deadbeefdeadbeef".to_owned();
     let forged_auth = build_digest_authorization("cpe", "secret", "GET", "/cr", &forged_chal, 1, "abc123");
     let mut s2 = TcpStream::connect(addr).unwrap();
-    s2.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {forged_auth}\r\n\r\n").as_bytes()).unwrap();
+    s2.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {forged_auth}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
     buf.clear();
     s2.read_to_string(&mut buf).unwrap();
     assert!(buf.starts_with("HTTP/1.1 401"), "forged nonce must be rejected: {buf}");
@@ -912,7 +1058,7 @@ fn test_conn_req_digest_nonce_replay_protection() {
     // 3. Valid nc=1 succeeds
     let auth_nc1 = build_digest_authorization("cpe", "secret", "GET", "/cr", &chal, 1, "abc123");
     let mut s3 = TcpStream::connect(addr).unwrap();
-    s3.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_nc1}\r\n\r\n").as_bytes()).unwrap();
+    s3.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_nc1}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
     buf.clear();
     s3.read_to_string(&mut buf).unwrap();
     assert!(buf.starts_with("HTTP/1.1 200"), "valid nc=1 should pass: {buf}");
@@ -920,7 +1066,7 @@ fn test_conn_req_digest_nonce_replay_protection() {
 
     // 4. Replaying exact nc=1 is rejected
     let mut s4 = TcpStream::connect(addr).unwrap();
-    s4.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_nc1}\r\n\r\n").as_bytes()).unwrap();
+    s4.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_nc1}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
     buf.clear();
     s4.read_to_string(&mut buf).unwrap();
     assert!(buf.starts_with("HTTP/1.1 401"), "replayed nc=1 must be rejected: {buf}");
@@ -929,10 +1075,25 @@ fn test_conn_req_digest_nonce_replay_protection() {
     // 5. Advancing nc=2 with same issued nonce succeeds
     let auth_nc2 = build_digest_authorization("cpe", "secret", "GET", "/cr", &chal, 2, "def456");
     let mut s5 = TcpStream::connect(addr).unwrap();
-    s5.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_nc2}\r\n\r\n").as_bytes()).unwrap();
+    s5.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_nc2}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
     buf.clear();
     s5.read_to_string(&mut buf).unwrap();
     assert!(buf.starts_with("HTTP/1.1 200"), "advancing nc=2 should pass: {buf}");
+
+    // 6. A response without qop, which the challenge asks for, passes once per nonce
+    let mut s6 = TcpStream::connect(addr).unwrap();
+    s6.write_all(b"GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    buf.clear();
+    s6.read_to_string(&mut buf).unwrap();
+    let auth_plain = build_digest_authorization("cpe", "secret", "GET", "/cr", &digest_challenge_of(&buf), 1, "abc123");
+    assert!(!auth_plain.contains("qop="), "{auth_plain}");
+    for expected in ["HTTP/1.1 200", "HTTP/1.1 401"] {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(format!("GET /cr HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth_plain}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        buf.clear();
+        s.read_to_string(&mut buf).unwrap();
+        assert!(buf.starts_with(expected), "response without qop, expected {expected}: {buf}");
+    }
 
     srv.stop();
     let _ = fs::remove_dir_all(&dir);

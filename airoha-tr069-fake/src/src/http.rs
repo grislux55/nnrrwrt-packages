@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use digest_auth::{
     Algorithm, AuthContext, AuthorizationHeader, Charset, HttpMethod, Qop, WwwAuthenticateHeader,
@@ -22,6 +22,17 @@ use crate::net_iso::{connect_isolated_tcp, InterfaceRuntime};
 pub const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONN_REQ_HEADER_BYTES: usize = 8 * 1024;
+/// Requests answered on one connection request connection: the challenge, the
+/// authenticated retry and one spare.
+const MAX_CONN_REQ_REQUESTS: usize = 3;
+/// Time one connection request connection may hold its listener, and the longest wait
+/// for more bytes within that time.
+const CONN_REQ_TIMEOUT: Duration = Duration::from_secs(10);
+const CONN_REQ_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Header values of the stock client and of its connection request server.
+const ACS_USER_AGENT: &str = "TR069 Client 1.0";
+const CONN_REQ_REALM: &str = "TR069 Client";
+const CONN_REQ_SERVER: &str = "TR069 client TCP connection request Server";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UrlParts {
@@ -293,23 +304,15 @@ impl AcsHttpClient {
         soap_action: Option<&str>,
         auth_header: Option<&str>,
     ) -> Vec<u8> {
-        let host_hdr = if (self.url.is_https && self.url.port == 443)
-            || (!self.url.is_https && self.url.port == 80)
-        {
-            self.url.host.clone()
-        } else {
-            format!("{}:{}", self.url.host, self.url.port)
-        };
+        // Header order and text of the stock client. Host always carries the port,
+        // SOAPAction is the bare method name of a CPE request and empty for a reply,
+        // and an empty POST has neither SOAPAction nor a charset.
         let mut hdr = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: NNRRWrt-TR069-Fake/0.1\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
-            self.url.path_query,
-            host_hdr,
-            body.len()
+            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: {ACS_USER_AGENT}\r\n",
+            self.url.path_query, self.url.host, self.url.port
         );
-        if let Some(action) = soap_action {
-            hdr.push_str(&format!("SOAPAction: \"{action}\"\r\n"));
-        } else {
-            hdr.push_str("SOAPAction: \"\"\r\n");
+        if !body.is_empty() {
+            hdr.push_str("Content-Type: text/xml; charset=utf-8\r\n");
         }
         if let Some(auth) = auth_header {
             hdr.push_str(&format!("Authorization: {auth}\r\n"));
@@ -323,7 +326,15 @@ impl AcsHttpClient {
                 .join("; ");
             hdr.push_str(&format!("Cookie: {cookie_str}\r\n"));
         }
-        hdr.push_str("\r\n");
+        if body.is_empty() {
+            hdr.push_str("Content-Type: text/xml\r\nContent-Length: 0\r\n\r\n");
+        } else {
+            hdr.push_str(&format!(
+                "SOAPAction: {}\r\nContent-Length: {}\r\n\r\n",
+                soap_action.unwrap_or_default(),
+                body.len()
+            ));
+        }
         let mut bytes = hdr.into_bytes();
         bytes.extend_from_slice(body);
         bytes
@@ -814,7 +825,7 @@ impl ConnectionRequestServer {
         let stop = Arc::new(AtomicBool::new(false));
         let mut bound_addrs = Vec::new();
         let mut handles = Vec::new();
-        let realm = "NNRRWrt-TR069".to_owned();
+        let realm = CONN_REQ_REALM.to_owned();
         let nonce_tracker = Arc::new(Mutex::new(NonceTracker::default()));
         let mut listeners = Vec::with_capacity(bind_addrs.len());
         for addr in bind_addrs {
@@ -834,16 +845,21 @@ impl ConnectionRequestServer {
                 while !stop_c.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, peer)) => {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-                            handle_conn_req(
-                                &mut stream,
-                                peer,
-                                &creds_c,
-                                &realm_c,
-                                &tracker_c,
-                                &trig_c,
-                                &audit_c,
-                            );
+                            let deadline = Instant::now() + CONN_REQ_TIMEOUT;
+                            for _ in 0..MAX_CONN_REQ_REQUESTS {
+                                if !handle_conn_req(
+                                    &mut stream,
+                                    deadline,
+                                    peer,
+                                    &creds_c,
+                                    &realm_c,
+                                    &tracker_c,
+                                    &trig_c,
+                                    &audit_c,
+                                ) {
+                                    break;
+                                }
+                            }
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(50));
@@ -869,9 +885,36 @@ impl ConnectionRequestServer {
     }
 }
 
-fn read_conn_req_request<R: Read>(
-    stream: &mut R,
-) -> Option<(String, String, Option<String>, Vec<u8>)> {
+struct ConnReqRequest {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    body: Vec<u8>,
+    /// The peer asked for the connection to end after the response.
+    close: bool,
+}
+
+/// Reads request bytes, waiting no longer than the idle timeout or the time left until
+/// `deadline`. None on a timeout, an error or the end of the stream.
+fn read_conn_req_bytes(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let left = deadline.checked_duration_since(Instant::now())?;
+    if left.is_zero() {
+        return None;
+    }
+    stream
+        .set_read_timeout(Some(left.min(CONN_REQ_IDLE_TIMEOUT)))
+        .ok()?;
+    match stream.read(buf) {
+        Ok(n) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+fn read_conn_req_request(stream: &mut TcpStream, deadline: Instant) -> Option<ConnReqRequest> {
     let mut raw = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
     let header_end = loop {
@@ -879,10 +922,7 @@ fn read_conn_req_request<R: Read>(
             return None;
         }
         let max_read = chunk.len().min(MAX_CONN_REQ_HEADER_BYTES - raw.len());
-        let n = stream.read(&mut chunk[..max_read]).ok()?;
-        if n == 0 {
-            return None;
-        }
+        let n = read_conn_req_bytes(stream, deadline, &mut chunk[..max_read])?;
         raw.extend_from_slice(&chunk[..n]);
         let mut hdr_slots = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut hdr_slots);
@@ -893,7 +933,7 @@ fn read_conn_req_request<R: Read>(
         }
     };
 
-    let (method, req_path, auth_hdr, content_len) = {
+    let (method, req_path, auth_hdr, content_len, close) = {
         let mut hdr_slots = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut hdr_slots);
         req.parse(&raw[..header_end]).ok()?;
@@ -901,6 +941,8 @@ fn read_conn_req_request<R: Read>(
         let req_path = req.path.unwrap_or("/").to_owned();
         let mut auth_hdr = None;
         let mut content_len = 0usize;
+        // HTTP/1.0 ends the connection unless the peer asks to keep it.
+        let mut close = req.version == Some(0);
         for h in req.headers.iter() {
             if h.name.eq_ignore_ascii_case("authorization") {
                 if let Ok(v) = std::str::from_utf8(h.value) {
@@ -910,31 +952,58 @@ fn read_conn_req_request<R: Read>(
                 if let Ok(v) = std::str::from_utf8(h.value) {
                     content_len = v.trim().parse::<usize>().ok().filter(|&n| n <= 65_536)?;
                 }
+            } else if h.name.eq_ignore_ascii_case("connection") {
+                if let Ok(v) = std::str::from_utf8(h.value) {
+                    for token in v.split(',').map(str::trim) {
+                        if token.eq_ignore_ascii_case("close") {
+                            close = true;
+                        } else if token.eq_ignore_ascii_case("keep-alive") {
+                            close = false;
+                        }
+                    }
+                }
             }
         }
-        (method, req_path, auth_hdr, content_len)
+        (method, req_path, auth_hdr, content_len, close)
     };
 
-    let mut body = Vec::new();
-    if content_len > 0 {
-        let mut body_stream = Cursor::new(&raw[header_end..]).chain(stream);
-        body.resize(content_len, 0);
-        body_stream.read_exact(&mut body).ok()?;
+    let mut body = raw[header_end..].to_vec();
+    body.truncate(content_len);
+    while body.len() < content_len {
+        let max_read = chunk.len().min(content_len - body.len());
+        let n = read_conn_req_bytes(stream, deadline, &mut chunk[..max_read])?;
+        body.extend_from_slice(&chunk[..n]);
     }
-    Some((method, req_path, auth_hdr, body))
+    Some(ConnReqRequest {
+        method,
+        path: req_path,
+        authorization: auth_hdr,
+        body,
+        close,
+    })
 }
 
+/// Answers one connection request. Returns true when the peer may send another request
+/// on the same connection, which the stock server allows after its challenge.
 fn handle_conn_req(
     stream: &mut TcpStream,
+    deadline: Instant,
     peer: SocketAddr,
     creds: &Arc<Mutex<ConnReqCreds>>,
     realm: &str,
     nonce_tracker: &Arc<Mutex<NonceTracker>>,
     trigger_flag: &Arc<AtomicBool>,
     audit: &AuditLogger,
-) {
-    let Some((method, req_path, auth_hdr, body)) = read_conn_req_request(stream) else {
-        return;
+) -> bool {
+    let Some(ConnReqRequest {
+        method,
+        path: req_path,
+        authorization: auth_hdr,
+        body,
+        close,
+    }) = read_conn_req_request(stream, deadline)
+    else {
+        return false;
     };
     let cfg = creds.lock().expect("creds mutex poisoned").clone();
     let path_match = req_path.split('?').next().unwrap_or(&req_path) == cfg.path;
@@ -942,7 +1011,7 @@ fn handle_conn_req(
         let _ = stream.write_all(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
-        return;
+        return false;
     }
     let authorized = if cfg.username.is_empty() {
         true
@@ -964,16 +1033,21 @@ fn handle_conn_req(
             .lock()
             .expect("nonce tracker mutex poisoned")
             .issue();
+        // Challenge of the stock server: no qop, and no Connection header, because the
+        // peer may answer on the same connection.
+        let domain = digest_domain(&cfg.path);
         let resp = format!(
-            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"{realm}\", qop=\"auth\", nonce=\"{nonce}\", algorithm=MD5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 401 Authorization Required\r\nContent-Length: 0\r\nServer: {CONN_REQ_SERVER}\r\nWWW-Authenticate: Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=\"MD5\", domain=\"{domain}\"\r\n\r\n"
         );
-        audit.record(
-            "WARN",
-            "conn_req",
-            &format!("Unauthorized ConnectionRequest from {peer} path={req_path}"),
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        return;
+        // A request without credentials is the first half of every exchange.
+        if auth_hdr.is_some() {
+            audit.record(
+                "WARN",
+                "conn_req",
+                &format!("Unauthorized ConnectionRequest from {peer} path={req_path}"),
+            );
+        }
+        return stream.write_all(resp.as_bytes()).is_ok() && !close;
     }
     trigger_flag.store(true, Ordering::SeqCst);
     audit.record(
@@ -981,5 +1055,23 @@ fn handle_conn_req(
         "conn_req",
         &format!("Accepted ConnectionRequest from {peer} path={req_path}"),
     );
-    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nServer: {CONN_REQ_SERVER}\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    false
+}
+
+/// The connection request path as the domain of the challenge. A path that would need
+/// quoting is replaced by the root.
+fn digest_domain(path: &str) -> &str {
+    if !path.is_empty()
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+    {
+        path
+    } else {
+        "/"
+    }
 }

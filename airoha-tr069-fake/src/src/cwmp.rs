@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 use quick_xml::escape::{escape as qxml_escape, unescape as qxml_unescape};
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 use roxmltree::{Document, Node, ParsingOptions};
 
@@ -101,17 +101,40 @@ fn write_text_elem<W: std::io::Write>(
     let _ = w.write_event(Event::End(BytesEnd::new(tag)));
 }
 
+/// Writes an element without content as a start and an end tag: the stock client never
+/// sends a self-closing tag.
+fn write_empty_elem<W: std::io::Write>(w: &mut Writer<W>, tag: &str) {
+    let _ = w.write_event(Event::Start(BytesStart::new(tag)));
+    let _ = w.write_event(Event::End(BytesEnd::new(tag)));
+}
+
+/// Opens a SOAP array with the two attributes of the stock client, in its order.
+fn write_array_start<W: std::io::Write>(
+    w: &mut Writer<W>,
+    tag: &str,
+    item_type: &str,
+    len: usize,
+) {
+    let array_type = format!("{item_type}[{len}]");
+    let mut start = BytesStart::new(tag);
+    start.push_attribute(("xsi:type", "SOAP-ENC:Array"));
+    start.push_attribute(("SOAP-ENC:arrayType", array_type.as_str()));
+    let _ = w.write_event(Event::Start(start));
+}
+
 fn soap_wrap_with<F>(cwmp_id: Option<&str>, build_body: F) -> String
 where
     F: FnOnce(&mut Writer<&mut Vec<u8>>),
 {
     let mut buf = Vec::with_capacity(512);
     {
-        let mut w = Writer::new(&mut buf);
-        let _ = w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)));
+        // Layout of the stock client: no XML declaration, one tag per line without
+        // indentation, an element and its text on one line, a newline after the last tag.
+        // The SOAP-ENC namespace has no trailing slash there.
+        let mut w = Writer::new_with_indent(&mut buf, b' ', 0);
         let mut env = BytesStart::new("SOAP-ENV:Envelope");
         env.push_attribute(("xmlns:SOAP-ENV", "http://schemas.xmlsoap.org/soap/envelope/"));
-        env.push_attribute(("xmlns:SOAP-ENC", "http://schemas.xmlsoap.org/soap/encoding/"));
+        env.push_attribute(("xmlns:SOAP-ENC", "http://schemas.xmlsoap.org/soap/encoding"));
         env.push_attribute(("xmlns:xsd", "http://www.w3.org/2001/XMLSchema"));
         env.push_attribute(("xmlns:xsi", XSI_NS));
         env.push_attribute(("xmlns:cwmp", "urn:dslforum-org:cwmp-1-0"));
@@ -122,7 +145,7 @@ where
             write_text_elem(&mut w, "cwmp:ID", &[("SOAP-ENV:mustUnderstand", "1")], id);
             let _ = w.write_event(Event::End(BytesEnd::new("SOAP-ENV:Header")));
         } else {
-            let _ = w.write_event(Event::Empty(BytesStart::new("SOAP-ENV:Header")));
+            write_empty_elem(&mut w, "SOAP-ENV:Header");
         }
 
         let _ = w.write_event(Event::Start(BytesStart::new("SOAP-ENV:Body")));
@@ -130,6 +153,7 @@ where
         let _ = w.write_event(Event::End(BytesEnd::new("SOAP-ENV:Body")));
         let _ = w.write_event(Event::End(BytesEnd::new("SOAP-ENV:Envelope")));
     }
+    buf.push(b'\n');
     String::from_utf8(buf).unwrap_or_default()
 }
 
@@ -190,8 +214,6 @@ pub fn build_inform(
     ];
     let now = iso8601_now();
     let retry_str = retry_count.to_string();
-    let ev_arr_type = format!("cwmp:EventStruct[{}]", events.len());
-    let param_arr_type = format!("cwmp:ParameterValueStruct[{}]", inform_params.len());
 
     soap_wrap_with(Some(cwmp_id), |w| {
         let _ = w.write_event(Event::Start(BytesStart::new("cwmp:Inform")));
@@ -202,9 +224,7 @@ pub fn build_inform(
         write_text_elem(w, "SerialNumber", &[], serial_number);
         let _ = w.write_event(Event::End(BytesEnd::new("DeviceId")));
 
-        let mut ev_tag = BytesStart::new("Event");
-        ev_tag.push_attribute(("SOAP-ENC:arrayType", ev_arr_type.as_str()));
-        let _ = w.write_event(Event::Start(ev_tag));
+        write_array_start(w, "Event", "cwmp:EventStruct", events.len());
         for ev in events {
             let _ = w.write_event(Event::Start(BytesStart::new("EventStruct")));
             write_text_elem(w, "EventCode", &[], &ev.event_code);
@@ -217,9 +237,7 @@ pub fn build_inform(
         write_text_elem(w, "CurrentTime", &[], &now);
         write_text_elem(w, "RetryCount", &[], &retry_str);
 
-        let mut plist = BytesStart::new("ParameterList");
-        plist.push_attribute(("SOAP-ENC:arrayType", param_arr_type.as_str()));
-        let _ = w.write_event(Event::Start(plist));
+        write_array_start(w, "ParameterList", "cwmp:ParameterValueStruct", inform_params.len());
         for (name, val, ptype) in &inform_params {
             let _ = w.write_event(Event::Start(BytesStart::new("ParameterValueStruct")));
             write_text_elem(w, "Name", &[], name);
@@ -298,12 +316,9 @@ pub fn dispatch_rpc(
                 "Download",
                 "TransferComplete",
             ];
-            let arr_type = format!("xsd:string[{}]", methods.len());
             soap_wrap_with(id, |w| {
                 let _ = w.write_event(Event::Start(BytesStart::new("cwmp:GetRPCMethodsResponse")));
-                let mut ml = BytesStart::new("MethodList");
-                ml.push_attribute(("SOAP-ENC:arrayType", arr_type.as_str()));
-                let _ = w.write_event(Event::Start(ml));
+                write_array_start(w, "MethodList", "cwmp:string", methods.len());
                 for m in &methods {
                     write_text_elem(w, "string", &[], m);
                 }
@@ -316,12 +331,9 @@ pub fn dispatch_rpc(
             next_level,
         } => match model.get_parameter_names(parameter_path, *next_level) {
             Ok(items) => {
-                let arr_type = format!("cwmp:ParameterInfoStruct[{}]", items.len());
                 soap_wrap_with(id, |w| {
                     let _ = w.write_event(Event::Start(BytesStart::new("cwmp:GetParameterNamesResponse")));
-                    let mut pl = BytesStart::new("ParameterList");
-                    pl.push_attribute(("SOAP-ENC:arrayType", arr_type.as_str()));
-                    let _ = w.write_event(Event::Start(pl));
+                    write_array_start(w, "ParameterList", "cwmp:ParameterInfoStruct", items.len());
                     for (name, writable) in &items {
                         let _ = w.write_event(Event::Start(BytesStart::new("ParameterInfoStruct")));
                         write_text_elem(w, "Name", &[], name);
@@ -337,12 +349,9 @@ pub fn dispatch_rpc(
         CwmpMessage::GetParameterValues { parameter_names } => {
             match model.get_parameter_values(parameter_names) {
                 Ok(items) => {
-                    let arr_type = format!("cwmp:ParameterValueStruct[{}]", items.len());
                     soap_wrap_with(id, |w| {
                         let _ = w.write_event(Event::Start(BytesStart::new("cwmp:GetParameterValuesResponse")));
-                        let mut pl = BytesStart::new("ParameterList");
-                        pl.push_attribute(("SOAP-ENC:arrayType", arr_type.as_str()));
-                        let _ = w.write_event(Event::Start(pl));
+                        write_array_start(w, "ParameterList", "cwmp:ParameterValueStruct", items.len());
                         for (name, val, ptype) in &items {
                             let _ = w.write_event(Event::Start(BytesStart::new("ParameterValueStruct")));
                             write_text_elem(w, "Name", &[], name);
@@ -373,21 +382,15 @@ pub fn dispatch_rpc(
         CwmpMessage::GetParameterAttributes { parameter_names } => {
             match model.get_parameter_attributes(parameter_names) {
                 Ok(items) => {
-                    let arr_type = format!("cwmp:ParameterAttributeStruct[{}]", items.len());
                     soap_wrap_with(id, |w| {
                         let _ = w.write_event(Event::Start(BytesStart::new("cwmp:GetParameterAttributesResponse")));
-                        let mut pl = BytesStart::new("ParameterList");
-                        pl.push_attribute(("SOAP-ENC:arrayType", arr_type.as_str()));
-                        let _ = w.write_event(Event::Start(pl));
+                        write_array_start(w, "ParameterList", "cwmp:ParameterAttributeStruct", items.len());
                         for (name, notif, acl) in &items {
                             let notif_str = notif.to_string();
-                            let acl_type = format!("xsd:string[{}]", acl.len());
                             let _ = w.write_event(Event::Start(BytesStart::new("ParameterAttributeStruct")));
                             write_text_elem(w, "Name", &[], name);
                             write_text_elem(w, "Notification", &[], &notif_str);
-                            let mut al = BytesStart::new("AccessList");
-                            al.push_attribute(("SOAP-ENC:arrayType", acl_type.as_str()));
-                            let _ = w.write_event(Event::Start(al));
+                            write_array_start(w, "AccessList", "cwmp:String", acl.len());
                             for s in acl {
                                 write_text_elem(w, "string", &[], s);
                             }
@@ -404,7 +407,7 @@ pub fn dispatch_rpc(
         CwmpMessage::SetParameterAttributes { items } => {
             match model.set_parameter_attributes(items) {
                 Ok(()) => soap_wrap_with(id, |w| {
-                    let _ = w.write_event(Event::Empty(BytesStart::new("cwmp:SetParameterAttributesResponse")));
+                    write_empty_elem(w, "cwmp:SetParameterAttributesResponse");
                 }),
                 Err(f) => build_fault(id, &f),
             }
@@ -439,7 +442,7 @@ pub fn dispatch_rpc(
             Ok(()) => {
                 virtual_reboot = true;
                 soap_wrap_with(id, |w| {
-                    let _ = w.write_event(Event::Empty(BytesStart::new("cwmp:RebootResponse")));
+                    write_empty_elem(w, "cwmp:RebootResponse");
                 })
             }
             Err(f) => build_fault(id, &f),
@@ -448,7 +451,7 @@ pub fn dispatch_rpc(
             Ok(()) => {
                 virtual_reboot = true;
                 soap_wrap_with(id, |w| {
-                    let _ = w.write_event(Event::Empty(BytesStart::new("cwmp:FactoryResetResponse")));
+                    write_empty_elem(w, "cwmp:FactoryResetResponse");
                 })
             }
             Err(f) => build_fault(id, &f),

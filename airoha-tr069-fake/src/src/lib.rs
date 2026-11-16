@@ -18,6 +18,7 @@ use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 use audit::AuditLogger;
 use config::FakeConfig;
+use crypto_tls::random_u64;
 use cwmp::{
     build_fault, build_inform, build_transfer_complete, dispatch_rpc, parse_cwmp_envelope,
     CwmpMessage,
@@ -211,18 +212,22 @@ pub fn run_cwmp_session(
     audit: &AuditLogger,
     conn_creds: Option<&Arc<Mutex<ConnReqCreds>>>,
 ) -> Result<SessionSummary, SessionError> {
-    let mut client = send_inform(cfg, model, rt, extra_events, retry_count, audit).map_err(
-        |cause| SessionError {
-            inform_accepted: false,
-            cause,
-        },
-    )?;
+    // Every request of a session carries the same cwmp:ID, a random 31-bit decimal as in
+    // the stock client.
+    let session_id = (random_u64() >> 33).to_string();
+    let mut client =
+        send_inform(cfg, model, rt, extra_events, retry_count, &session_id, audit).map_err(
+            |cause| SessionError {
+                inform_accepted: false,
+                cause,
+            },
+        )?;
     // The ACS has the events. A state file that cannot be written fails the session, so
     // the retry wait bounds how often the events on flash go out again.
     model
         .consume_pending_events()
         .map_err(|e| io::Error::other(format!("cannot save pending events: {e}")))
-        .and_then(|()| serve_acs(&mut client, cfg, model, audit, conn_creds))
+        .and_then(|()| serve_acs(&mut client, cfg, model, &session_id, audit, conn_creds))
         .map_err(|cause| SessionError {
             inform_accepted: true,
             cause,
@@ -247,6 +252,7 @@ fn send_inform(
     rt: &InterfaceRuntime,
     extra_events: &[&str],
     retry_count: u32,
+    session_id: &str,
     audit: &AuditLogger,
 ) -> io::Result<AcsHttpClient> {
     if cfg.acs_url.is_empty() {
@@ -297,7 +303,7 @@ fn send_inform(
     };
     let _ = model.update_runtime_endpoints(runtime_conn_url, rt.ipv4_addrs.first().copied());
 
-    let inform_xml = build_inform("1", model, &events, &conn_req_url, retry_count);
+    let inform_xml = build_inform(session_id, model, &events, &conn_req_url, retry_count);
     audit.record(
         "INFO",
         "cwmp",
@@ -307,7 +313,7 @@ fn send_inform(
             events.iter().map(|e| e.event_code.as_str()).collect::<Vec<_>>()
         ),
     );
-    let resp = client.post_cwmp(&inform_xml, Some("urn:dslforum-org:cwmp-1-0#Inform"))?;
+    let resp = client.post_cwmp(&inform_xml, Some("Inform"))?;
     if !(200..300).contains(&resp.status) {
         return Err(io::Error::other(format!(
             "ACS rejected Inform with HTTP {}",
@@ -328,17 +334,18 @@ fn serve_acs(
     client: &mut AcsHttpClient,
     cfg: &mut FakeConfig,
     model: &mut VirtualModel,
+    session_id: &str,
     audit: &AuditLogger,
     conn_creds: Option<&Arc<Mutex<ConnReqCreds>>>,
 ) -> io::Result<SessionSummary> {
     while let Some(tr) = model.pending.transfers.first().cloned() {
-        let tc_xml = build_transfer_complete("tc-1", &tr);
+        let tc_xml = build_transfer_complete(session_id, &tr);
         audit.record(
             "INFO",
             "cwmp",
             &format!("Sending TransferComplete command_key={}", tr.command_key),
         );
-        let tc_resp = client.post_cwmp(&tc_xml, Some("urn:dslforum-org:cwmp-1-0#TransferComplete"))?;
+        let tc_resp = client.post_cwmp(&tc_xml, Some("TransferComplete"))?;
         if !(200..300).contains(&tc_resp.status) {
             return Err(io::Error::other(format!(
                 "ACS rejected TransferComplete with HTTP {}",
