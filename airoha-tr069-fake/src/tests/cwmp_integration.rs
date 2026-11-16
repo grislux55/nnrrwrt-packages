@@ -19,7 +19,7 @@ use airoha_tr069_fake::http::{
     build_digest_authorization, parse_digest_challenge, read_http_response,
     verify_digest_authorization, ConnReqCreds, ConnectionRequestServer, MAX_HTTP_BODY_BYTES,
 };
-use airoha_tr069_fake::model::{format_unix_timestamp, VirtualModel};
+use airoha_tr069_fake::model::{format_unix_timestamp, VirtualBootMark, VirtualModel};
 use airoha_tr069_fake::net_iso::{
     build_dns_query, parse_dns_response, query_dns_server_addr, InterfaceRuntime,
 };
@@ -694,8 +694,30 @@ fn test_cwmp_rpcs_names_attributes_factory_reset_and_effects() {
     let (reply, _, _) = dispatch_rpc(&env, &mut model, &cfg);
     let reply = reply.unwrap();
     assert!(reply.contains("GetRPCMethodsResponse"));
-    assert!(reply.contains("<string>FactoryReset</string>"));
-    assert!(reply.contains("<string>Download</string>"));
+    // The methods this CPE answers, in the order of the stock method table. Inform and
+    // TransferComplete are calls the CPE makes.
+    let method_list: String = [
+        "GetRPCMethods",
+        "Reboot",
+        "FactoryReset",
+        "GetParameterNames",
+        "GetParameterValues",
+        "GetParameterAttributes",
+        "SetParameterAttributes",
+        "SetParameterValues",
+        "AddObject",
+        "DeleteObject",
+        "Download",
+    ]
+    .iter()
+    .map(|name| format!("<string>{name}</string>\n"))
+    .collect();
+    assert!(
+        reply.contains(&format!(
+            "<MethodList xsi:type=\"SOAP-ENC:Array\" SOAP-ENC:arrayType=\"cwmp:string[11]\">\n{method_list}</MethodList>\n"
+        )),
+        "{reply}"
+    );
 
     let gpn_next = r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Header><cwmp:ID>m2</cwmp:ID></SOAP-ENV:Header><SOAP-ENV:Body><cwmp:GetParameterNames><ParameterPath>InternetGatewayDevice.DeviceInfo.</ParameterPath><NextLevel>1</NextLevel></cwmp:GetParameterNames></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
     let env = parse_cwmp_envelope(gpn_next).unwrap();
@@ -761,10 +783,14 @@ fn inform_response_http() -> String {
     format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
 }
 
-fn acs_request_http(cwmp_id: &str, rpc_xml: &str) -> String {
-    let body = format!(
+fn acs_envelope(cwmp_id: &str, rpc_xml: &str) -> String {
+    format!(
         r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Header><cwmp:ID>{cwmp_id}</cwmp:ID></SOAP-ENV:Header><SOAP-ENV:Body>{rpc_xml}</SOAP-ENV:Body></SOAP-ENV:Envelope>"#
-    );
+    )
+}
+
+fn acs_request_http(cwmp_id: &str, rpc_xml: &str) -> String {
+    let body = acs_envelope(cwmp_id, rpc_xml);
     format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
 }
 
@@ -1025,6 +1051,127 @@ fn test_acs_fault_reports_the_cwmp_fault_code() {
             message: "busy".to_owned(),
         }
     );
+}
+
+#[test]
+fn test_booleans_take_any_letter_case_and_declared_types_any_prefix() {
+    let dir = temp_dir("booleans");
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let enable = "InternetGatewayDevice.ManagementServer.PeriodicInformEnable";
+    let interval = "InternetGatewayDevice.ManagementServer.PeriodicInformInterval";
+    let pair = |name: &str, value: &str, declared: Option<&str>| {
+        vec![(name.to_owned(), value.to_owned(), declared.map(str::to_owned))]
+    };
+
+    for (text, stored) in [("False", false), ("TRUE", true), ("0", false), ("True", true)] {
+        let effects = model
+            .set_parameter_values(&pair(enable, text, Some("xsd:boolean")), "k-bool")
+            .unwrap();
+        assert_eq!(effects.periodic_inform_enable, Some(stored), "{text}");
+        assert_eq!(
+            model.get_value(enable),
+            Some(if stored { "true" } else { "false" }),
+            "{text}"
+        );
+    }
+    let fault = model
+        .set_parameter_values(&pair(enable, "yes", None), "k-bool")
+        .unwrap_err();
+    assert_eq!((fault.code, fault.param_faults[0].1), (9003, 9007));
+
+    // A declared type is compared by its name after the prefix.
+    for declared in ["xs:boolean", "boolean", "XSD:Boolean"] {
+        model
+            .set_parameter_values(&pair(enable, "true", Some(declared)), "k-type")
+            .unwrap();
+    }
+    model
+        .set_parameter_values(&pair(interval, "600", Some("xs:int")), "k-type")
+        .unwrap();
+    let fault = model
+        .set_parameter_values(&pair(enable, "true", Some("xsd:string")), "k-type")
+        .unwrap_err();
+    assert_eq!((fault.code, fault.param_faults[0].1), (9003, 9006));
+
+    let names = parse_cwmp_envelope(&acs_envelope(
+        "b1",
+        "<cwmp:GetParameterNames><ParameterPath>InternetGatewayDevice.</ParameterPath><NextLevel>True</NextLevel></cwmp:GetParameterNames>",
+    ))
+    .unwrap();
+    assert_eq!(
+        names.message,
+        CwmpMessage::GetParameterNames {
+            parameter_path: "InternetGatewayDevice.".to_owned(),
+            next_level: true,
+        }
+    );
+    let attributes = parse_cwmp_envelope(&acs_envelope(
+        "b2",
+        &format!(
+            "<cwmp:SetParameterAttributes><ParameterList><SetParameterAttributesStruct><Name>{enable}</Name><NotificationChange>TRUE</NotificationChange><Notification>2</Notification><AccessListChange>False</AccessListChange><AccessList><string>Subscriber</string></AccessList></SetParameterAttributesStruct></ParameterList></cwmp:SetParameterAttributes>"
+        ),
+    ))
+    .unwrap();
+    assert_eq!(
+        attributes.message,
+        CwmpMessage::SetParameterAttributes {
+            items: vec![(enable.to_owned(), Some(2), None)],
+        }
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_uptime_counts_from_the_last_virtual_boot() {
+    let dir = temp_dir("uptime");
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let name = "InternetGatewayDevice.DeviceInfo.UpTime";
+    let reported = |model: &VirtualModel| -> u64 {
+        model.get_parameter_values(&[name.to_owned()]).unwrap()[0]
+            .1
+            .parse()
+            .unwrap()
+    };
+    let kernel_uptime = || -> u64 {
+        fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| text.split('.').next().and_then(|secs| secs.parse().ok()))
+            .unwrap_or(0)
+    };
+
+    // Without a virtual boot the CPE has been up as long as the kernel.
+    let at_start = kernel_uptime();
+    let shown = reported(&model);
+    assert!(at_start <= shown && shown <= kernel_uptime(), "{shown}");
+
+    // A Reboot restarts the count. The mark is stored with the pending state, the model
+    // keeps its placeholder.
+    model.handle_reboot("rb-uptime").unwrap();
+    let mark = model.pending.virtual_boot_mark.clone().unwrap();
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    assert_eq!(model.pending.virtual_boot_mark, Some(mark.clone()));
+    assert_eq!(model.get_value(name), Some("0"));
+    let shown = reported(&model);
+    assert!(shown <= kernel_uptime() - at_start, "{shown}");
+
+    // A mark taken during another kernel boot does not count.
+    model.pending.virtual_boot_mark = Some(VirtualBootMark {
+        boot_id: "another-boot".to_owned(),
+        uptime_secs: u64::MAX,
+    });
+    assert!(reported(&model) >= at_start);
+
+    // A mark ahead of the clock gives 0.
+    model.pending.virtual_boot_mark = Some(VirtualBootMark {
+        boot_id: mark.boot_id,
+        uptime_secs: u64::MAX,
+    });
+    assert_eq!(reported(&model), 0);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1315,6 +1462,17 @@ fn test_dump_status_and_model_redact_secrets_without_writing_flash() {
             .and_then(|v| v.as_str()),
         Some("")
     );
+    // UpTime is computed when read, so both columns show the same number.
+    let uptime_of = |column: &str| {
+        parsed_model
+            .get(column)
+            .and_then(|m| m.get("InternetGatewayDevice.DeviceInfo.UpTime"))
+            .and_then(|p| p.get("value"))
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    assert!(uptime_of("model").is_some());
+    assert_eq!(uptime_of("model"), uptime_of("template"));
 
     let status_json = dump_sanitized_status_json(
         &cfg_path,
@@ -1397,6 +1555,20 @@ fn test_runtime_endpoints_and_parameter_key_mirror() {
     model
         .delete_object(&format!("InternetGatewayDevice.WANDevice.{inst}."), "pk-del-1")
         .unwrap();
+    assert_eq!(model.get_value("Device.ManagementServer.ParameterKey"), Some("pk-del-1"));
+
+    // A local write keeps the key of the last change by the ACS.
+    model
+        .set_single_from_ui("InternetGatewayDevice.DeviceInfo.ProvisioningCode", "LOCAL")
+        .unwrap();
+    assert_eq!(
+        model.get_value("InternetGatewayDevice.DeviceInfo.ProvisioningCode"),
+        Some("LOCAL")
+    );
+    assert_eq!(
+        model.get_value("InternetGatewayDevice.ManagementServer.ParameterKey"),
+        Some("pk-del-1")
+    );
     assert_eq!(model.get_value("Device.ManagementServer.ParameterKey"), Some("pk-del-1"));
     let _ = fs::remove_dir_all(&dir);
 }

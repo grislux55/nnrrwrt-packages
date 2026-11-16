@@ -7,7 +7,8 @@ use roxmltree::{Document, Node, ParsingOptions};
 
 use crate::config::FakeConfig;
 use crate::model::{
-    iso8601_now, CwmpFault, ManagementEffects, PendingEvent, PendingTransfer, VirtualModel,
+    iso8601_now, parse_boolean, CwmpFault, ManagementEffects, PendingEvent, PendingTransfer,
+    VirtualModel,
 };
 
 const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
@@ -301,20 +302,19 @@ pub fn dispatch_rpc(
             return (None, effects, false);
         }
         CwmpMessage::GetRPCMethods => {
+            // The methods this CPE answers, in the order of the stock method table.
             let methods = [
-                "Inform",
                 "GetRPCMethods",
-                "GetParameterNames",
-                "GetParameterValues",
-                "SetParameterValues",
-                "GetParameterAttributes",
-                "SetParameterAttributes",
-                "AddObject",
-                "DeleteObject",
                 "Reboot",
                 "FactoryReset",
+                "GetParameterNames",
+                "GetParameterValues",
+                "GetParameterAttributes",
+                "SetParameterAttributes",
+                "SetParameterValues",
+                "AddObject",
+                "DeleteObject",
                 "Download",
-                "TransferComplete",
             ];
             soap_wrap_with(id, |w| {
                 let _ = w.write_event(Event::Start(BytesStart::new("cwmp:GetRPCMethodsResponse")));
@@ -604,7 +604,7 @@ fn extract_cwmp_envelope(doc: &Document<'_>) -> Result<ParsedEnvelope, String> {
         "GetParameterNames" => {
             let parameter_path = child_text_trimmed(rpc, "ParameterPath").unwrap_or_default();
             let nl = child_text_trimmed(rpc, "NextLevel").unwrap_or_default();
-            let next_level = matches!(nl.as_str(), "1" | "true" | "TRUE");
+            let next_level = parse_boolean(&nl).unwrap_or(false);
             CwmpMessage::GetParameterNames {
                 parameter_path,
                 next_level,
@@ -659,7 +659,7 @@ fn extract_cwmp_envelope(doc: &Document<'_>) -> Result<ParsedEnvelope, String> {
                 for c in list.children().filter(|c| c.is_element()) {
                     let name = child_text_trimmed(c, "Name").unwrap_or_default();
                     let notif_change = child_text_trimmed(c, "NotificationChange")
-                        .map(|s| matches!(s.as_str(), "1" | "true"))
+                        .and_then(|s| parse_boolean(&s))
                         .unwrap_or(false);
                     let notif = if notif_change {
                         child_text_trimmed(c, "Notification").and_then(|s| s.parse::<u8>().ok())
@@ -667,7 +667,7 @@ fn extract_cwmp_envelope(doc: &Document<'_>) -> Result<ParsedEnvelope, String> {
                         None
                     };
                     let acl_change = child_text_trimmed(c, "AccessListChange")
-                        .map(|s| matches!(s.as_str(), "1" | "true"))
+                        .and_then(|s| parse_boolean(&s))
                         .unwrap_or(false);
                     let acl = if acl_change {
                         Some(

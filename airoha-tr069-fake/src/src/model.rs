@@ -90,6 +90,25 @@ pub struct PendingTransfer {
     pub complete_time: String,
 }
 
+/// Kernel uptime at the last virtual boot. It counts only within the kernel boot that
+/// boot_id names.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualBootMark {
+    #[serde(default)]
+    pub boot_id: String,
+    #[serde(default)]
+    pub uptime_secs: u64,
+}
+
+impl VirtualBootMark {
+    fn now() -> Self {
+        Self {
+            boot_id: kernel_boot_id(),
+            uptime_secs: kernel_uptime_secs(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingState {
     #[serde(default)]
@@ -98,6 +117,8 @@ pub struct PendingState {
     pub transfers: Vec<PendingTransfer>,
     #[serde(default = "default_boot_epoch")]
     pub virtual_boot_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_boot_mark: Option<VirtualBootMark>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -166,6 +187,7 @@ impl VirtualModel {
                 }],
                 transfers: Vec::new(),
                 virtual_boot_epoch: 1,
+                virtual_boot_mark: None,
             }
         };
         if pending.events.is_empty() && !model_path.exists() {
@@ -307,15 +329,17 @@ impl VirtualModel {
             }],
             transfers: Vec::new(),
             virtual_boot_epoch: self.pending.virtual_boot_epoch + 1,
+            virtual_boot_mark: Some(VirtualBootMark::now()),
         };
         self.save_model()?;
         self.save_pending()?;
         Ok(())
     }
 
+    /// A local write. It leaves ParameterKey alone, which names the last change the ACS made.
     pub fn set_single_from_ui(&mut self, path: &str, value: &str) -> Result<(), String> {
         let pairs = vec![(path.to_owned(), value.to_owned(), None)];
-        self.set_parameter_values(&pairs, "luci-ui")
+        self.write_parameter_values(&pairs, None)
             .map(|_| ())
             .map_err(|f| format!("CWMP {}: {}", f.code, f.message))
     }
@@ -362,6 +386,14 @@ impl VirtualModel {
         Ok(())
     }
 
+    /// The stored value, or the current one for a parameter that is computed when read.
+    fn read_value(&self, name: &str, entry: &ParamEntry) -> String {
+        if is_uptime_param(name) {
+            return virtual_uptime_secs(self.pending.virtual_boot_mark.as_ref()).to_string();
+        }
+        entry.value.clone()
+    }
+
     pub fn get_parameter_values(&self, names: &[String]) -> Result<Vec<(String, String, String)>, CwmpFault> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
@@ -377,7 +409,7 @@ impl VirtualModel {
                     if k.starts_with(q) {
                         matched = true;
                         if seen.insert(k.clone()) {
-                            out.push((k.clone(), v.value.clone(), v.ptype.clone()));
+                            out.push((k.clone(), self.read_value(k, v), v.ptype.clone()));
                         }
                     }
                 }
@@ -386,7 +418,7 @@ impl VirtualModel {
                 }
             } else if let Some(v) = self.params.get(q) {
                 if seen.insert(q.to_owned()) {
-                    out.push((q.to_owned(), v.value.clone(), v.ptype.clone()));
+                    out.push((q.to_owned(), self.read_value(q, v), v.ptype.clone()));
                 }
             } else {
                 return Err(CwmpFault::simple(9005, format!("Invalid parameter name: {query}")));
@@ -441,10 +473,31 @@ impl VirtualModel {
         Ok(entries.into_iter().collect())
     }
 
+    /// Records the ParameterKey of the last write by the ACS under both roots.
+    fn set_parameter_key(&mut self, key: &str) {
+        for name in [
+            "InternetGatewayDevice.ManagementServer.ParameterKey",
+            "Device.ManagementServer.ParameterKey",
+        ] {
+            if let Some(entry) = self.params.get_mut(name) {
+                entry.value = key.to_owned();
+            }
+        }
+    }
+
     pub fn set_parameter_values(
         &mut self,
         pairs: &[(String, String, Option<String>)],
         parameter_key: &str,
+    ) -> Result<ManagementEffects, CwmpFault> {
+        self.write_parameter_values(pairs, Some(parameter_key))
+    }
+
+    /// Validates and stores the values. Only a write by the ACS carries a ParameterKey.
+    fn write_parameter_values(
+        &mut self,
+        pairs: &[(String, String, Option<String>)],
+        parameter_key: Option<&str>,
     ) -> Result<ManagementEffects, CwmpFault> {
         let mut param_faults = Vec::new();
         for (name, val, declared_type) in pairs {
@@ -457,7 +510,7 @@ impl VirtualModel {
                 continue;
             }
             if let Some(dt) = declared_type {
-                if !dt.is_empty() && dt != &entry.ptype && !(dt == "xsd:int" && entry.ptype == "xsd:unsignedInt") {
+                if !dt.is_empty() && !declared_type_matches(dt, &entry.ptype) {
                     param_faults.push((name.clone(), 9006, "Invalid parameter type".to_owned()));
                     continue;
                 }
@@ -486,11 +539,8 @@ impl VirtualModel {
             mirror_mgmt_side_effect(name, &normalized, &mut effects);
             mirror_tr098_tr181(&mut self.params, name, &normalized);
         }
-        if let Some(pk) = self.params.get_mut("InternetGatewayDevice.ManagementServer.ParameterKey") {
-            pk.value = parameter_key.to_owned();
-        }
-        if let Some(pk) = self.params.get_mut("Device.ManagementServer.ParameterKey") {
-            pk.value = parameter_key.to_owned();
+        if let Some(key) = parameter_key {
+            self.set_parameter_key(key);
         }
         self.save_model()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
@@ -609,12 +659,7 @@ impl VirtualModel {
                 access_list: vec!["Subscriber".to_owned()],
             },
         );
-        if let Some(pk) = self.params.get_mut("InternetGatewayDevice.ManagementServer.ParameterKey") {
-            pk.value = parameter_key.to_owned();
-        }
-        if let Some(pk) = self.params.get_mut("Device.ManagementServer.ParameterKey") {
-            pk.value = parameter_key.to_owned();
-        }
+        self.set_parameter_key(parameter_key);
         self.save_model()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
         Ok(new_id)
@@ -643,15 +688,16 @@ impl VirtualModel {
         }
         self.objects.retain(|o| !o.starts_with(object_name));
         self.params.retain(|k, _| !k.starts_with(object_name));
-        if let Some(pk) = self.params.get_mut("InternetGatewayDevice.ManagementServer.ParameterKey") {
-            pk.value = parameter_key.to_owned();
-        }
-        if let Some(pk) = self.params.get_mut("Device.ManagementServer.ParameterKey") {
-            pk.value = parameter_key.to_owned();
-        }
+        self.set_parameter_key(parameter_key);
         self.save_model()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
         Ok(())
+    }
+
+    /// Starts a new virtual boot: DeviceInfo.UpTime counts from here.
+    fn mark_virtual_boot(&mut self) {
+        self.pending.virtual_boot_epoch += 1;
+        self.pending.virtual_boot_mark = Some(VirtualBootMark::now());
     }
 
     /// Queues an event for the next Inform. A numbered event occurs once per Inform,
@@ -668,7 +714,7 @@ impl VirtualModel {
     }
 
     pub fn handle_reboot(&mut self, command_key: &str) -> Result<(), CwmpFault> {
-        self.pending.virtual_boot_epoch += 1;
+        self.mark_virtual_boot();
         self.queue_event("M Reboot", command_key);
         self.queue_event("1 BOOT", "");
         self.save_pending()
@@ -722,7 +768,7 @@ impl VirtualModel {
         };
         self.pending.transfers.push(transfer.clone());
         // The mapped image replaces the firmware, so the virtual CPE boots into it.
-        self.pending.virtual_boot_epoch += 1;
+        self.mark_virtual_boot();
         self.queue_event("1 BOOT", "");
         self.queue_event("7 TRANSFER COMPLETE", "");
         self.queue_event("M Download", command_key);
@@ -816,7 +862,8 @@ fn build_initial_template(cfg: &FakeConfig) -> BTreeMap<String, ParamEntry> {
     add("InternetGatewayDevice.DeviceInfo.SoftwareVersion", &cfg.software_version, "xsd:string", false);
     add("InternetGatewayDevice.DeviceInfo.SpecVersion", "1.0", "xsd:string", false);
     add("InternetGatewayDevice.DeviceInfo.ProvisioningCode", "", "xsd:string", true);
-    add("InternetGatewayDevice.DeviceInfo.UpTime", "120", "xsd:unsignedInt", false);
+    // Placeholder: the value is computed when the parameter is read.
+    add("InternetGatewayDevice.DeviceInfo.UpTime", "0", "xsd:unsignedInt", false);
 
     add("InternetGatewayDevice.ManagementServer.EnableCWMP", "true", "xsd:boolean", true);
     add("InternetGatewayDevice.ManagementServer.URL", &cfg.acs_url, "xsd:string", true);
@@ -930,9 +977,59 @@ fn mirror_tr098_tr181(params: &mut BTreeMap<String, ParamEntry>, name: &str, val
     }
 }
 
+fn is_uptime_param(name: &str) -> bool {
+    name.ends_with(".DeviceInfo.UpTime")
+}
+
+/// Seconds since the kernel started.
+fn kernel_uptime_secs() -> u64 {
+    fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| text.split('.').next().and_then(|secs| secs.trim().parse().ok()))
+        .unwrap_or(0)
+}
+
+fn kernel_boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// DeviceInfo.UpTime: seconds since the last virtual boot, or since the kernel started
+/// when no virtual boot happened during this kernel boot.
+fn virtual_uptime_secs(mark: Option<&VirtualBootMark>) -> u64 {
+    let uptime = kernel_uptime_secs();
+    match mark {
+        Some(mark) if mark.boot_id == kernel_boot_id() => uptime.saturating_sub(mark.uptime_secs),
+        _ => uptime,
+    }
+}
+
+/// Reads an xsd:boolean. Besides the four spellings of XML Schema it takes true and
+/// false in any letter case.
+pub fn parse_boolean(text: &str) -> Option<bool> {
+    let text = text.trim();
+    if text == "1" || text.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if text == "0" || text.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Compares a declared xsi:type with the stored type by the name after the prefix: the
+/// prefix is whatever the ACS bound to the XML Schema namespace. An int is accepted for
+/// an unsignedInt.
+fn declared_type_matches(declared: &str, ptype: &str) -> bool {
+    let local = |t: &str| t.trim().rsplit(':').next().unwrap_or(t).to_ascii_lowercase();
+    let (declared, ptype) = (local(declared), local(ptype));
+    declared == ptype || (declared == "int" && ptype == "unsignedint")
+}
+
 fn validate_type_value(ptype: &str, val: &str) -> bool {
     match ptype {
-        "xsd:boolean" => matches!(val, "0" | "1" | "true" | "false"),
+        "xsd:boolean" => parse_boolean(val).is_some(),
         "xsd:unsignedInt" => val.parse::<u64>().is_ok(),
         "xsd:int" => val.parse::<i64>().is_ok(),
         _ => true,
@@ -941,10 +1038,7 @@ fn validate_type_value(ptype: &str, val: &str) -> bool {
 
 fn normalize_value(ptype: &str, val: &str) -> String {
     if ptype == "xsd:boolean" {
-        return match val {
-            "1" | "true" => "true".to_owned(),
-            _ => "false".to_owned(),
-        };
+        return parse_boolean(val).unwrap_or(false).to_string();
     }
     val.to_owned()
 }
@@ -1009,9 +1103,25 @@ pub fn dump_sanitized_model_json(cfg: &FakeConfig) -> Result<String, String> {
             access_list: vec!["Subscriber".to_owned()],
         });
     }
+    let uptime = virtual_uptime_secs(
+        load_pending_file(&dir.join("pending_events.json"))
+            .ok()
+            .and_then(|pending| pending.virtual_boot_mark)
+            .as_ref(),
+    )
+    .to_string();
+    let view = |map: &BTreeMap<String, ParamEntry>| {
+        let mut shown = sanitize_params_map(map);
+        for (name, entry) in shown.iter_mut() {
+            if is_uptime_param(name) {
+                entry.value = uptime.clone();
+            }
+        }
+        shown
+    };
     serde_json::to_string(&json!({
-        "model": sanitize_params_map(&params),
-        "template": sanitize_params_map(&template),
+        "model": view(&params),
+        "template": view(&template),
     }))
     .map_err(|e| e.to_string())
 }
