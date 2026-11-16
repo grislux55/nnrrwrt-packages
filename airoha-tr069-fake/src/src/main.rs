@@ -16,7 +16,7 @@ use airoha_tr069_fake::audit::{AuditLogger, DEFAULT_AUDIT_LOG_PATH};
 use airoha_tr069_fake::config::FakeConfig;
 use airoha_tr069_fake::crypto_tls::random_u64;
 use airoha_tr069_fake::http::{ConnReqCreds, ConnectionRequestServer};
-use airoha_tr069_fake::model::VirtualModel;
+use airoha_tr069_fake::model::{StateLock, VirtualModel};
 use airoha_tr069_fake::net_iso::InterfaceRuntime;
 use airoha_tr069_fake::{
     apply_effects_to_config, apply_overlay_from_config, dump_sanitized_model_json,
@@ -30,6 +30,9 @@ const DEFAULT_CONTROL_SOCK: &str = "/var/run/airoha-tr069-fake.sock";
 /// Delay between a virtual reboot and its boot Inform.
 const VIRTUAL_REBOOT_SECS: u64 = 15;
 const DAD_HOLD_SECS: u64 = 10;
+/// How long a command waits for a running session or another command. procd kills a
+/// daemon that is being restarted after 5 s, and LuCI gives a command 20 s.
+const STATE_LOCK_WAIT: Duration = Duration::from_secs(15);
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
@@ -118,7 +121,31 @@ fn open_audit(cfg: &FakeConfig) -> AuditLogger {
     })
 }
 
+/// Locks the state directory for a command that changes the model. The caller loads the
+/// model afterwards and holds the lock until it has saved. Prints why the lock is not free.
+fn lock_state(config_path: &Path) -> Option<StateLock> {
+    let cfg = if config_path.exists() {
+        FakeConfig::load_json_file(config_path)
+    } else {
+        Ok(FakeConfig::default())
+    };
+    let lock = cfg.and_then(|cfg| {
+        StateLock::acquire(Path::new(&cfg.state_dir), STATE_LOCK_WAIT)
+            .map_err(|e| format!("cannot lock {}: {e}", cfg.state_dir))
+    });
+    match lock {
+        Ok(lock) => Some(lock),
+        Err(e) => {
+            eprintln!("error: {e}");
+            None
+        }
+    }
+}
+
 fn run_inform_once(config_path: &Path) -> i32 {
+    let Some(_state_lock) = lock_state(config_path) else {
+        return 1;
+    };
     let (mut cfg, mut model) = match load_effective_cfg_and_model(config_path) {
         Ok(v) => v,
         Err(e) => {
@@ -142,6 +169,9 @@ fn run_inform_once(config_path: &Path) -> i32 {
 }
 
 fn run_reset_virtual(config_path: &Path) -> i32 {
+    let Some(_state_lock) = lock_state(config_path) else {
+        return 1;
+    };
     let (cfg, mut model) = match load_raw_cfg_and_model(config_path) {
         Ok(v) => v,
         Err(e) => {
@@ -160,6 +190,9 @@ fn run_reset_virtual(config_path: &Path) -> i32 {
 }
 
 fn run_apply_overlay(config_path: &Path) -> i32 {
+    let Some(_state_lock) = lock_state(config_path) else {
+        return 1;
+    };
     let (cfg, _model) = match apply_overlay_from_config(config_path) {
         Ok(v) => v,
         Err(e) => {
@@ -177,6 +210,9 @@ fn run_set_param(config_path: &Path, name: &str, value: &str) -> i32 {
         eprintln!("--param NAME VALUE is required");
         return 2;
     }
+    let Some(_state_lock) = lock_state(config_path) else {
+        return 1;
+    };
     let (cfg, mut model) = match load_raw_cfg_and_model(config_path) {
         Ok(v) => v,
         Err(e) => {
@@ -383,6 +419,8 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
     let mut reboot_until: Option<Instant> = None;
     // What the last accepted Inform reported about the interface.
     let mut reported_endpoints: Option<RuntimeEndpoints> = None;
+    // Set once the state directory refused a lock; sessions then run without one.
+    let mut lock_failure_logged = false;
     let daemon_started = Instant::now();
     let mut last_inform = Instant::now();
     let mut last_poll_check = Instant::now();
@@ -489,6 +527,35 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
 
         // A manual trigger sends what is owed, or "2 PERIODIC" when nothing is.
         if manual || conn_req || scheduled {
+            // The lock covers the reload, the session and its writes. While a command holds
+            // it the session waits for a later tick.
+            let _state_lock = match StateLock::try_acquire(Path::new(&base_cfg.state_dir)) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    if manual {
+                        manual_trigger.store(true, Ordering::SeqCst);
+                    }
+                    if conn_req {
+                        conn_req_trigger.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                Err(e) => {
+                    if !lock_failure_logged {
+                        lock_failure_logged = true;
+                        audit.record(
+                            "WARN",
+                            "model",
+                            &format!(
+                                "Cannot lock {}: {e}; sessions run unlocked",
+                                base_cfg.state_dir
+                            ),
+                        );
+                    }
+                    None
+                }
+            };
             if let Ok(fresh_model) = VirtualModel::load_or_init(&base_cfg) {
                 model = fresh_model;
                 apply_effects_to_config(&mut cfg, &model.current_management_effects(), Some(&conn_creds));

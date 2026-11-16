@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
@@ -1163,6 +1164,52 @@ fn load_pending_file(path: &Path) -> Result<PendingState, String> {
     let mut pending: PendingState = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     pending.events.retain(|e| !e.event_code.is_empty());
     Ok(pending)
+}
+
+/// How often `StateLock::acquire()` tries again.
+const STATE_LOCK_RETRY: Duration = Duration::from_millis(50);
+
+/// Exclusive lock on the state directory. The daemon holds it for a session and a command
+/// for its change, each from loading the model to saving it: a writer that loaded earlier
+/// would otherwise store its copy over the change of the other.
+#[derive(Debug)]
+pub struct StateLock {
+    _dir: fs::File,
+}
+
+impl StateLock {
+    /// Ok(None) while another holder has the lock. Dropping the value ends the lock.
+    pub fn try_acquire(state_dir: &Path) -> io::Result<Option<Self>> {
+        fs::create_dir_all(state_dir)?;
+        let dir = fs::File::open(state_dir)?;
+        // SAFETY: flock() only takes the descriptor, which `dir` keeps open.
+        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(Self { _dir: dir }));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(err)
+        }
+    }
+
+    /// Tries for up to `timeout`. A lock that is still held then is ErrorKind::WouldBlock.
+    pub fn acquire(state_dir: &Path, timeout: Duration) -> io::Result<Self> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(lock) = Self::try_acquire(state_dir)? {
+                return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "the state is in use by a session or another command",
+                ));
+            }
+            std::thread::sleep(STATE_LOCK_RETRY);
+        }
+    }
 }
 
 pub fn atomic_write_string(path: &Path, content: &str) -> Result<(), String> {

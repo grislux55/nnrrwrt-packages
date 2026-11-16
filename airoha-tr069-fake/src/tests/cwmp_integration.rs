@@ -19,7 +19,9 @@ use airoha_tr069_fake::http::{
     build_digest_authorization, parse_digest_challenge, read_http_response,
     verify_digest_authorization, ConnReqCreds, ConnectionRequestServer, MAX_HTTP_BODY_BYTES,
 };
-use airoha_tr069_fake::model::{format_unix_timestamp, VirtualBootMark, VirtualModel};
+use airoha_tr069_fake::model::{
+    format_unix_timestamp, StateLock, VirtualBootMark, VirtualModel,
+};
 use airoha_tr069_fake::net_iso::{
     build_dns_query, parse_dns_response, query_dns_server_addr, InterfaceRuntime,
 };
@@ -1364,6 +1366,26 @@ fn test_runtime_endpoints_differ_by_the_values_the_interface_offers() {
     let disabled = RuntimeEndpoints::of(&cfg, &rt);
     assert_eq!(disabled.conn_req_url.as_deref(), Some(""));
     assert!(disabled.differs_from(&reported));
+}
+
+#[test]
+fn test_state_lock_admits_one_holder() {
+    let dir = temp_dir("state-lock");
+    let held = StateLock::try_acquire(&dir).unwrap().expect("a free directory is lockable");
+    assert!(StateLock::try_acquire(&dir).unwrap().is_none());
+    let err = StateLock::acquire(&dir, Duration::from_millis(120)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+    // A waiting command gets the lock once the holder has saved and dropped it.
+    let waiter = {
+        let dir = dir.clone();
+        std::thread::spawn(move || StateLock::acquire(&dir, Duration::from_secs(5)).map(drop))
+    };
+    std::thread::sleep(Duration::from_millis(150));
+    drop(held);
+    waiter.join().unwrap().expect("the lock is free after the drop");
+    assert!(StateLock::try_acquire(&dir).unwrap().is_some());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
