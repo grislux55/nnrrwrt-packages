@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
+use crate::audit::is_sensitive_param_name;
 use crate::config::{DownloadMapping, FakeConfig};
 
 fn default_ptype() -> String {
@@ -971,16 +972,11 @@ fn write_model_json(path: &Path, params: &BTreeMap<String, ParamEntry>) -> Resul
     atomic_write_string(path, &pretty)
 }
 
-fn is_secret_param_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower.contains("password") || lower.contains("secret")
-}
-
 fn sanitize_params_map(params: &BTreeMap<String, ParamEntry>) -> BTreeMap<String, ParamEntry> {
     let mut root = BTreeMap::new();
     for (k, v) in params {
         let mut cloned = v.clone();
-        if is_secret_param_key(k) && !cloned.value.is_empty() {
+        if is_sensitive_param_name(k) && !cloned.value.is_empty() {
             cloned.value = "***".to_owned();
         }
         root.insert(k.clone(), cloned);
@@ -988,7 +984,7 @@ fn sanitize_params_map(params: &BTreeMap<String, ParamEntry>) -> BTreeMap<String
     root
 }
 
-/// Returns `{"template":...,"model":...}` with password/secret values redacted and zero
+/// Returns `{"template":...,"model":...}` with the values of sensitive parameters redacted and zero
 /// filesystem writes (safe under read-only LuCI ACLs even when TR-069 Fake is disabled).
 pub fn dump_sanitized_model_json(cfg: &FakeConfig) -> Result<String, String> {
     let dir = PathBuf::from(&cfg.state_dir);

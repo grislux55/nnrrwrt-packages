@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use airoha_tr069_fake::audit::{redact_secrets, AuditLogger};
+use airoha_tr069_fake::audit::{is_sensitive_param_name, redact_secrets, AuditLogger};
 use airoha_tr069_fake::config::{parse_omci_export_json, DownloadMapping, FakeConfig};
 use airoha_tr069_fake::crypto_tls::{md5_hex, sha256_hex};
 use airoha_tr069_fake::cwmp::{dispatch_rpc, parse_cwmp_envelope, xml_unescape, CwmpMessage};
@@ -229,6 +229,95 @@ fn test_audit_log_redaction_and_tmp_ring_bounds() {
     let redacted = redact_secrets("Authorization: Basic dXNlcjpwYXNz password='abc'");
     assert!(!redacted.contains("dXNlcjpwYXNz"));
     assert!(!redacted.contains("'abc'"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_redaction_hides_wlan_keys_and_subscriber_identities() {
+    for name in [
+        "InternetGatewayDevice.ManagementServer.Password",
+        "InternetGatewayDevice.ManagementServer.ConnectionRequestPassword",
+        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.KeyPassphrase",
+        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase",
+        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.PreSharedKey",
+        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.WEPKey.1.WEPKey",
+        "InternetGatewayDevice.X_CT-COM_UserInfo.UserName",
+        "InternetGatewayDevice.X_CT-COM_UserInfo.UserId",
+        "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.WANPPPConnection.1.Username",
+        "Device.PPP.Interface.1.Username",
+        "Device.WiFi.AccessPoint.1.Security.SAEPassphrase",
+    ] {
+        assert!(is_sensitive_param_name(name), "{name}");
+    }
+    for name in [
+        "InternetGatewayDevice.ManagementServer.Username",
+        "InternetGatewayDevice.ManagementServer.ConnectionRequestUsername",
+        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.WEPKeyIndex",
+        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.AssociatedDeviceMACAddress",
+        "InternetGatewayDevice.DeviceInfo.SoftwareVersion",
+        "InternetGatewayDevice.",
+    ] {
+        assert!(!is_sensitive_param_name(name), "{name}");
+    }
+
+    let value_struct = |name: &str, value: &str| {
+        format!("<ParameterValueStruct>\n<Name>{name}</Name>\n<Value xsi:type=\"xsd:string\">{value}</Value>\n</ParameterValueStruct>\n")
+    };
+    let body = [
+        value_struct("InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase", "wlan-passphrase-1"),
+        value_struct("InternetGatewayDevice.X_CT-COM_UserInfo.UserName", "loid-0001"),
+        value_struct("InternetGatewayDevice.X_CT-COM_UserInfo.UserId", "loid-pass-2"),
+        value_struct("InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.WANPPPConnection.1.Username", "ppp-account-3"),
+        value_struct("InternetGatewayDevice.ManagementServer.Username", "acs-user-4"),
+        // A sensitive name without a value of its own leaves the next value alone.
+        "<ParameterInfoStruct>\n<Name>InternetGatewayDevice.ManagementServer.Password</Name>\n<Writable>1</Writable>\n</ParameterInfoStruct>\n".to_owned(),
+        value_struct("InternetGatewayDevice.DeviceInfo.SoftwareVersion", "fw-version-5"),
+        "<ParameterValueStruct>\n<Name>InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.WEPKey.1.WEPKey</Name>\n<Value xsi:type=\"xsd:string\"/>\n</ParameterValueStruct>\n".to_owned(),
+        value_struct("InternetGatewayDevice.DeviceInfo.HardwareVersion", "hw-version-6"),
+    ]
+    .concat();
+    let redacted = redact_secrets(&body);
+    for hidden in ["wlan-passphrase-1", "loid-0001", "loid-pass-2", "ppp-account-3"] {
+        assert!(!redacted.contains(hidden), "{hidden} left in: {redacted}");
+    }
+    for kept in ["acs-user-4", "fw-version-5", "hw-version-6"] {
+        assert!(redacted.contains(kept), "{kept} missing in: {redacted}");
+    }
+    assert_eq!(redacted.matches("***</Value>").count(), 4);
+
+    // A value that holds markup in CDATA, and one cut off before its end tag.
+    let cdata = redact_secrets(
+        "<Name>InternetGatewayDevice.X_CT-COM_UserInfo.UserId</Name>\n<Value><![CDATA[cdata<Name>pass-7]]></Value>\n<Name>InternetGatewayDevice.DeviceInfo.ProductClass</Name>\n<Value>class-8</Value>",
+    );
+    assert!(!cdata.contains("pass-7"), "{cdata}");
+    assert!(cdata.contains("class-8"), "{cdata}");
+    let cut = redact_secrets(
+        "<Name>InternetGatewayDevice.ManagementServer.ConnectionRequestPassword</Name>\n<Value xsi:type=\"xsd:string\">cut-off-9",
+    );
+    assert!(!cut.contains("cut-off-9"), "{cut}");
+    assert!(cut.ends_with("***"), "{cut}");
+}
+
+#[test]
+fn test_audit_message_with_line_breaks_takes_one_entry() {
+    let dir = temp_dir("audit_lines");
+    let log_path = dir.join("tr069-fake.log");
+    let logger = AuditLogger::with_limits(&log_path, 5, 4096);
+    logger.record("INFO", "cwmp", "first");
+    logger.record(
+        "DEBUG",
+        "cwmp_tx",
+        "<SOAP-ENV:Body>\n<cwmp:RebootResponse>\r\n</cwmp:RebootResponse>\n</SOAP-ENV:Body>\n",
+    );
+    let snap = logger.snapshot();
+    assert_eq!(snap.len(), 2);
+    assert!(
+        snap[1].ends_with(
+            "[DEBUG] [cwmp_tx] <SOAP-ENV:Body> <cwmp:RebootResponse> </cwmp:RebootResponse> </SOAP-ENV:Body>"
+        ),
+        "{}",
+        snap[1]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

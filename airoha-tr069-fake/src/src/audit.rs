@@ -52,7 +52,7 @@ impl AuditLogger {
 
     pub fn record(&self, level: &str, category: &str, message: &str) {
         let ts = now_secs();
-        let sanitized = redact_secrets(message);
+        let sanitized = single_line(&redact_secrets(message));
         let line = format!("[{ts}] [{level}] [{category}] {sanitized}");
         let mut guard = self.inner.lock().expect("audit mutex poisoned");
         guard.entries = load_entries_from_path(&guard.path, guard.max_entries, guard.max_bytes);
@@ -120,6 +120,14 @@ fn flush_to_tmp(path: &Path, entries: &VecDeque<String>) -> std::io::Result<()> 
     fs::rename(&tmp_path, path)
 }
 
+/// The ring keeps one entry per line, so line breaks inside a message become spaces.
+fn single_line(text: &str) -> String {
+    text.split(['\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -127,7 +135,8 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Redacts passwords, HTTP Basic/Digest Authorization headers, and XML secret tags.
+/// Redacts passwords, HTTP Basic/Digest Authorization headers, XML secret tags and the
+/// values of sensitive CWMP parameters.
 pub fn redact_secrets(input: &str) -> String {
     let mut out = input.to_owned();
 
@@ -146,8 +155,29 @@ pub fn redact_secrets(input: &str) -> String {
     }
 
     out = redact_xml_tag(&out, "Password");
-    out = redact_cwmp_password_param(&out);
+    out = redact_cwmp_param_values(&out);
     out
+}
+
+/// Whether a data model parameter holds a credential or identifies the subscriber,
+/// judged by its name: passwords and secrets anywhere in the path, WLAN keys, the PPP
+/// account, and the operator's UserInfo pair that carries the LOID.
+pub fn is_sensitive_param_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("password") || lower.contains("secret") {
+        return true;
+    }
+    let (parent, leaf) = lower.rsplit_once('.').unwrap_or(("", lower.as_str()));
+    match leaf {
+        "presharedkey" | "wepkey" => true,
+        "username" => {
+            parent.contains("wanpppconnection")
+                || parent.contains("ppp.interface")
+                || parent.ends_with("userinfo")
+        }
+        "userid" => parent.ends_with("userinfo"),
+        _ => leaf.ends_with("passphrase"),
+    }
 }
 
 fn redact_case_insensitive_header(input: &str, prefix_lower: &str) -> String {
@@ -266,30 +296,41 @@ fn redact_xml_tag(input: &str, tag: &str) -> String {
     out
 }
 
-fn redact_cwmp_password_param(input: &str) -> String {
-    let mut out = input.to_owned();
-    for marker in ["Password</Name>", "PasswordKey</Name>"] {
-        let mut next_out = String::with_capacity(out.len());
-        let mut idx = 0;
-        while let Some(pos) = out[idx..].find(marker) {
-            let abs = idx + pos + marker.len();
-            if let Some(val_rel) = out[abs..].find("<Value") {
-                let val_tag_start = abs + val_rel;
-                if let Some(gt_rel) = out[val_tag_start..].find('>') {
-                    let content_start = val_tag_start + gt_rel + 1;
-                    if let Some(close_rel) = out[content_start..].find("</Value>") {
-                        next_out.push_str(&out[idx..content_start]);
-                        next_out.push_str("***</Value>");
-                        idx = content_start + close_rel + "</Value>".len();
-                        continue;
-                    }
-                }
-            }
-            next_out.push_str(&out[idx..abs]);
-            idx = abs;
+/// Hides the value that follows a sensitive parameter name in a ParameterValueStruct.
+fn redact_cwmp_param_values(input: &str) -> String {
+    const NAME_END: &str = "</Name>";
+    const VALUE_END: &str = "</Value>";
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0;
+    while let Some(pos) = input[idx..].find(NAME_END) {
+        let name_end = idx + pos;
+        let name = input[idx..name_end].rsplit('>').next().unwrap_or("").trim();
+        let after_name = name_end + NAME_END.len();
+        out.push_str(&input[idx..after_name]);
+        idx = after_name;
+        if !is_sensitive_param_name(name) {
+            continue;
         }
-        next_out.push_str(&out[idx..]);
-        out = next_out;
+        // The value belongs to this name only when it starts before the next name.
+        let scope_end = input[idx..].find("<Name").map_or(input.len(), |p| idx + p);
+        let Some(tag_start) = input[idx..scope_end].find("<Value").map(|p| idx + p) else {
+            continue;
+        };
+        let Some(tag_end) = input[tag_start..].find('>').map(|p| tag_start + p) else {
+            continue;
+        };
+        if input[..tag_end].ends_with('/') {
+            continue;
+        }
+        let content_start = tag_end + 1;
+        // A value without its end tag was cut off: hide what is left of the text.
+        let content_end = input[content_start..]
+            .find(VALUE_END)
+            .map_or(input.len(), |p| content_start + p);
+        out.push_str(&input[idx..content_start]);
+        out.push_str("***");
+        idx = content_end;
     }
+    out.push_str(&input[idx..]);
     out
 }
