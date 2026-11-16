@@ -14,19 +14,21 @@ use std::time::{Duration, Instant, SystemTime};
 
 use airoha_tr069_fake::audit::{AuditLogger, DEFAULT_AUDIT_LOG_PATH};
 use airoha_tr069_fake::config::FakeConfig;
+use airoha_tr069_fake::crypto_tls::random_u64;
 use airoha_tr069_fake::http::{ConnReqCreds, ConnectionRequestServer};
 use airoha_tr069_fake::model::VirtualModel;
 use airoha_tr069_fake::net_iso::InterfaceRuntime;
 use airoha_tr069_fake::{
     apply_effects_to_config, apply_overlay_from_config, dump_sanitized_model_json,
     dump_sanitized_status_json, load_effective_cfg_and_model, load_raw_cfg_and_model,
-    run_cwmp_session,
+    retry_wait_secs, run_cwmp_session,
 };
 use serde_json::json;
 
 const DEFAULT_CONFIG_PATH: &str = "/tmp/tr069-fake-runtime.json";
 const DEFAULT_CONTROL_SOCK: &str = "/var/run/airoha-tr069-fake.sock";
-const STARTUP_RETRY_SECS: u64 = 15;
+/// Delay between a virtual reboot and its boot Inform.
+const VIRTUAL_REBOOT_SECS: u64 = 15;
 const DAD_HOLD_SECS: u64 = 10;
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -126,7 +128,7 @@ fn run_inform_once(config_path: &Path) -> i32 {
     };
     let audit = open_audit(&cfg);
     let rt = InterfaceRuntime::inspect(&cfg.tr069_ifname);
-    match run_cwmp_session(&mut cfg, &mut model, &rt, Some("6 CONNECTION REQUEST"), &audit, None) {
+    match run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None) {
         Ok(summary) => {
             println!("Inform completed: rpcs_handled={}", summary.rpcs_handled);
             0
@@ -283,6 +285,43 @@ fn effective_cfg(base: &FakeConfig, model: &VirtualModel) -> FakeConfig {
     cfg
 }
 
+/// Session retry state. As in stock, the count the Inform reports is kept apart from the
+/// step on the wait ladder.
+#[derive(Default)]
+struct RetryState {
+    /// Failed sessions since the last complete one, reported as RetryCount.
+    count: u32,
+    /// Retries waited for in a row.
+    step: u32,
+    /// When the next retry starts.
+    at: Option<Instant>,
+}
+
+impl RetryState {
+    fn fail(&mut self) -> Duration {
+        self.count = self.count.saturating_add(1);
+        self.step = self.step.saturating_add(1);
+        let wait = Duration::from_secs(retry_wait_secs(self.step, random_u64()));
+        self.at = Some(Instant::now() + wait);
+        wait
+    }
+
+    /// The interface or the settings changed, so the cause of the failures may be gone:
+    /// retry at once and start over with the shortest wait.
+    fn hasten(&mut self) {
+        if self.at.is_some() {
+            self.step = 0;
+            self.at = Some(Instant::now());
+        }
+    }
+}
+
+fn owe_event(owed: &mut Vec<&'static str>, event_code: &'static str) {
+    if !owed.contains(&event_code) {
+        owed.push(event_code);
+    }
+}
+
 fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
     let (mut base_cfg, mut model) = match load_raw_cfg_and_model(config_path) {
         Ok(v) => v,
@@ -302,7 +341,8 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
         ),
     );
 
-    let trigger_inform = Arc::new(AtomicBool::new(false));
+    let manual_trigger = Arc::new(AtomicBool::new(false));
+    let conn_req_trigger = Arc::new(AtomicBool::new(false));
     let conn_creds = Arc::new(Mutex::new(ConnReqCreds {
         path: cfg.conn_req_path.clone(),
         username: cfg.conn_req_username.clone(),
@@ -317,16 +357,18 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
     update_status_snapshot(&status_snapshot, &cfg, &active_rt, &model);
     let _sock_thread = start_control_socket(
         sock_path,
-        Arc::clone(&trigger_inform),
+        Arc::clone(&manual_trigger),
         Arc::clone(&stop_flag),
         Arc::clone(&status_snapshot),
     );
 
     let mut conn_srv: Option<ConnectionRequestServer> =
-        maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &trigger_inform, &audit);
+        maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &conn_req_trigger, &audit);
 
-    let mut startup_inform_pending = true;
-    let mut last_startup_attempt: Option<Instant> = None;
+    // Events the next Inform carries beside the ones queued in the model.
+    let mut owed_events: Vec<&'static str> = vec!["1 BOOT"];
+    let mut retry = RetryState::default();
+    let mut reboot_until: Option<Instant> = None;
     let daemon_started = Instant::now();
     let mut last_inform = Instant::now();
     let mut last_poll_check = Instant::now();
@@ -364,8 +406,9 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                             old.stop();
                         }
                         active_rt = InterfaceRuntime::inspect(&cfg.tr069_ifname);
-                        conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &trigger_inform, &audit);
+                        conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &conn_req_trigger, &audit);
                     }
+                    retry.hasten();
                     state_changed = true;
                 }
             } else {
@@ -390,9 +433,9 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                 if let Some(old) = conn_srv.take() {
                     old.stop();
                 }
-                conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &trigger_inform, &audit);
-                if startup_inform_pending && gained_addr {
-                    last_startup_attempt = None;
+                conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &conn_req_trigger, &audit);
+                if gained_addr {
+                    retry.hasten();
                 }
                 state_changed = true;
             }
@@ -402,19 +445,31 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
             }
         }
 
-        let manual_or_cr = trigger_inform.swap(false, Ordering::SeqCst);
+        let manual = manual_trigger.swap(false, Ordering::SeqCst);
+        let conn_req = conn_req_trigger.swap(false, Ordering::SeqCst);
+        if conn_req {
+            owe_event(&mut owed_events, "6 CONNECTION REQUEST");
+        }
+        if cfg.periodic_inform_enable
+            && last_inform.elapsed() >= Duration::from_secs(cfg.periodic_inform_interval)
+        {
+            owe_event(&mut owed_events, "2 PERIODIC");
+        }
+        let now = Instant::now();
         let dad_hold = !active_rt.ipv6_tentative.is_empty()
             && daemon_started.elapsed() < Duration::from_secs(DAD_HOLD_SECS);
-        let startup_due = startup_inform_pending
-            && !dad_hold
-            && last_startup_attempt
-                .map(|t| t.elapsed() >= Duration::from_secs(STARTUP_RETRY_SECS))
-                .unwrap_or(true);
-        let periodic_due = !startup_inform_pending
-            && cfg.periodic_inform_enable
-            && last_inform.elapsed() >= Duration::from_secs(cfg.periodic_inform_interval);
+        let rebooting = reboot_until.is_some_and(|t| now < t);
+        let undelivered = !owed_events.is_empty()
+            || !model.pending.events.is_empty()
+            || !model.pending.transfers.is_empty();
+        let scheduled = match retry.at {
+            // After a failed session only its retry timer starts the next one.
+            Some(t) => now >= t,
+            None => undelivered && !dad_hold && !rebooting,
+        };
 
-        if manual_or_cr || startup_due || periodic_due {
+        // A manual trigger sends what is owed, or "2 PERIODIC" when nothing is.
+        if manual || conn_req || scheduled {
             if let Ok(fresh_model) = VirtualModel::load_or_init(&base_cfg) {
                 model = fresh_model;
                 apply_effects_to_config(&mut cfg, &model.current_management_effects(), Some(&conn_creds));
@@ -425,31 +480,21 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                 if let Some(old) = conn_srv.take() {
                     old.stop();
                 }
-                conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &trigger_inform, &audit);
+                conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &conn_req_trigger, &audit);
             }
-            let boot_queued = model
-                .pending
-                .events
-                .iter()
-                .any(|e| e.event_code == "1 BOOT" || e.event_code == "0 BOOTSTRAP");
-            let ev = if manual_or_cr {
-                Some("6 CONNECTION REQUEST")
-            } else if startup_due {
-                if model.pending.events.is_empty() {
-                    Some("1 BOOT")
-                } else {
-                    None
-                }
-            } else {
-                Some("2 PERIODIC")
-            };
-            match run_cwmp_session(&mut cfg, &mut model, &active_rt, ev, &audit, Some(&conn_creds))
-            {
+            match run_cwmp_session(
+                &mut cfg,
+                &mut model,
+                &active_rt,
+                &owed_events,
+                retry.count,
+                &audit,
+                Some(&conn_creds),
+            ) {
                 Ok(summary) => {
-                    if startup_due || boot_queued {
-                        startup_inform_pending = false;
-                        last_startup_attempt = None;
-                    }
+                    owed_events.clear();
+                    retry = RetryState::default();
+                    reboot_until = None;
                     last_inform = Instant::now();
                     audit.record(
                         "INFO",
@@ -460,22 +505,42 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                         ),
                     );
                     if summary.virtual_reboot_requested {
-                        startup_inform_pending = true;
-                        last_startup_attempt = Some(Instant::now());
+                        reboot_until =
+                            Some(Instant::now() + Duration::from_secs(VIRTUAL_REBOOT_SECS));
                         audit.record(
                             "INFO",
                             "cwmp",
-                            &format!("Virtual reboot: boot Inform in {STARTUP_RETRY_SECS} s"),
+                            &format!("Virtual reboot: boot Inform in {VIRTUAL_REBOOT_SECS} s"),
                         );
                     }
                 }
                 Err(e) => {
-                    if startup_due {
-                        last_startup_attempt = Some(Instant::now());
-                    } else if periodic_due && !manual_or_cr {
+                    if e.inform_accepted {
+                        owed_events.clear();
                         last_inform = Instant::now();
+                    } else {
+                        // A connection request event is not delivered again.
+                        owed_events.retain(|ev| *ev != "6 CONNECTION REQUEST");
                     }
-                    audit.record("WARN", "cwmp", &format!("Session error: {e}"));
+                    let owes_retry = e.inform_accepted
+                        || !owed_events.is_empty()
+                        || !model.pending.events.is_empty()
+                        || !model.pending.transfers.is_empty();
+                    if owes_retry || retry.at.is_some() {
+                        let wait = retry.fail();
+                        audit.record(
+                            "WARN",
+                            "cwmp",
+                            &format!(
+                                "Session error: {e}; retry {} in {} s",
+                                retry.count,
+                                wait.as_secs()
+                            ),
+                        );
+                    } else {
+                        // A trigger with nothing to deliver is not retried.
+                        audit.record("WARN", "cwmp", &format!("Session error: {e}"));
+                    }
                 }
             }
             last_model_mtime = file_mtime(&model_json_path);

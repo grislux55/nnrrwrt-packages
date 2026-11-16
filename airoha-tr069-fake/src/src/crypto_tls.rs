@@ -42,6 +42,11 @@ pub fn random_hex_nonce() -> String {
     sha256_hex(input.as_bytes())[..32].to_owned()
 }
 
+/// Random value for retry jitter and message IDs.
+pub fn random_u64() -> u64 {
+    u64::from_str_radix(&random_hex_nonce()[..16], 16).unwrap_or_default()
+}
+
 fn build_tls_connect_config(
     sni_host: &str,
     insecure_tls: bool,

@@ -11,6 +11,8 @@ use crate::model::{
 };
 
 const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+/// TR-069 Unknown Time, for a time that does not apply yet.
+const UNKNOWN_TIME: &str = "0001-01-01T00:00:00Z";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CwmpMessage {
@@ -456,13 +458,18 @@ pub fn dispatch_rpc(
             file_type,
             url,
         } => match model.handle_download(command_key, file_type, url, &cfg.download_mappings) {
-            Ok(tr) => soap_wrap_with(id, |w| {
-                let _ = w.write_event(Event::Start(BytesStart::new("cwmp:DownloadResponse")));
-                write_text_elem(w, "Status", &[], "1");
-                write_text_elem(w, "StartTime", &[], &tr.start_time);
-                write_text_elem(w, "CompleteTime", &[], &tr.complete_time);
-                let _ = w.write_event(Event::End(BytesEnd::new("cwmp:DownloadResponse")));
-            }),
+            Ok(_) => {
+                // Status 1: the result follows in TransferComplete after the virtual
+                // reboot, so both times are unknown here.
+                virtual_reboot = true;
+                soap_wrap_with(id, |w| {
+                    let _ = w.write_event(Event::Start(BytesStart::new("cwmp:DownloadResponse")));
+                    write_text_elem(w, "Status", &[], "1");
+                    write_text_elem(w, "StartTime", &[], UNKNOWN_TIME);
+                    write_text_elem(w, "CompleteTime", &[], UNKNOWN_TIME);
+                    let _ = w.write_event(Event::End(BytesEnd::new("cwmp:DownloadResponse")));
+                })
+            }
             Err(f) => build_fault(id, &f),
         },
         CwmpMessage::Fault { .. } => return (None, effects, false),
@@ -695,10 +702,20 @@ fn extract_cwmp_envelope(doc: &Document<'_>) -> Result<ParsedEnvelope, String> {
             file_type: child_text_trimmed(rpc, "FileType").unwrap_or_default(),
             url: child_text_trimmed(rpc, "URL").unwrap_or_default(),
         },
-        "Fault" => CwmpMessage::Fault {
-            code: child_text_trimmed(rpc, "faultcode").unwrap_or_else(|| "Fault".to_owned()),
-            message: child_text_trimmed(rpc, "faultstring").unwrap_or_default(),
-        },
+        "Fault" => {
+            // The CWMP fault sits in detail/cwmp:Fault; faultcode only says Client or Server.
+            let detail = find_child_elem(rpc, "detail").and_then(|d| find_child_elem(d, "Fault"));
+            CwmpMessage::Fault {
+                code: detail
+                    .and_then(|f| child_text_trimmed(f, "FaultCode"))
+                    .or_else(|| child_text_trimmed(rpc, "faultcode"))
+                    .unwrap_or_else(|| "Fault".to_owned()),
+                message: detail
+                    .and_then(|f| child_text_trimmed(f, "FaultString"))
+                    .or_else(|| child_text_trimmed(rpc, "faultstring"))
+                    .unwrap_or_default(),
+            }
+        }
         other => CwmpMessage::Unsupported {
             method: other.to_owned(),
         },

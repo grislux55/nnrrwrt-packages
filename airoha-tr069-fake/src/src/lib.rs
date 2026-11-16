@@ -8,6 +8,7 @@ pub mod http;
 pub mod model;
 pub mod net_iso;
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -28,6 +29,16 @@ use net_iso::InterfaceRuntime;
 
 /// Consecutive unparsable ACS replies after which a session is abandoned.
 const MAX_MALFORMED_REPLIES: u32 = 3;
+const RETRY_MIN_WAIT_SECS: u64 = 5;
+const RETRY_MAX_STEPS: u32 = 10;
+
+/// Seconds to wait before the `step`-th session retry in a row. Stock retry_later waits
+/// m * k^(n-1) seconds plus a random amount below that, with m = 5 and k = 2, and holds
+/// n at 10: 5 to 10 s at first, 2560 to 5120 s from the tenth retry on.
+pub fn retry_wait_secs(step: u32, random: u64) -> u64 {
+    let base = RETRY_MIN_WAIT_SECS << (step.clamp(1, RETRY_MAX_STEPS) - 1);
+    base + random % base
+}
 
 pub fn load_raw_cfg_and_model(config_path: &Path) -> Result<(FakeConfig, VirtualModel), String> {
     let cfg = if config_path.exists() {
@@ -140,6 +151,22 @@ pub struct SessionSummary {
     pub effects_applied: ManagementEffects,
 }
 
+/// A failed session. `inform_accepted` tells whether the ACS took the Inform, and with it
+/// the events of the session, before the failure.
+#[derive(Debug)]
+pub struct SessionError {
+    pub inform_accepted: bool,
+    pub cause: io::Error,
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for SessionError {}
+
 pub fn apply_effects_to_config(
     cfg: &mut FakeConfig,
     eff: &ManagementEffects,
@@ -173,14 +200,55 @@ pub fn apply_effects_to_config(
     }
 }
 
+/// Runs one CWMP session: the Inform, the queued TransferComplete calls, then the requests
+/// of the ACS. `retry_count` is the number of failed sessions since the last complete one.
 pub fn run_cwmp_session(
     cfg: &mut FakeConfig,
     model: &mut VirtualModel,
     rt: &InterfaceRuntime,
-    extra_event: Option<&str>,
+    extra_events: &[&str],
+    retry_count: u32,
     audit: &AuditLogger,
     conn_creds: Option<&Arc<Mutex<ConnReqCreds>>>,
-) -> io::Result<SessionSummary> {
+) -> Result<SessionSummary, SessionError> {
+    let mut client = send_inform(cfg, model, rt, extra_events, retry_count, audit).map_err(
+        |cause| SessionError {
+            inform_accepted: false,
+            cause,
+        },
+    )?;
+    // The ACS has the events. A state file that cannot be written fails the session, so
+    // the retry wait bounds how often the events on flash go out again.
+    model
+        .consume_pending_events()
+        .map_err(|e| io::Error::other(format!("cannot save pending events: {e}")))
+        .and_then(|()| serve_acs(&mut client, cfg, model, audit, conn_creds))
+        .map_err(|cause| SessionError {
+            inform_accepted: true,
+            cause,
+        })
+}
+
+/// A SOAP Fault in a 2xx reply to a CPE request: the ACS refused the request.
+fn acs_fault(body: &[u8]) -> Option<String> {
+    let env = parse_cwmp_envelope(&String::from_utf8_lossy(body)).ok()?;
+    match env.message {
+        CwmpMessage::Fault { code, message } => Some(format!("{code} {message}")),
+        _ => None,
+    }
+}
+
+/// Connects to the ACS and delivers the Inform. It carries the queued events,
+/// `extra_events` and "7 TRANSFER COMPLETE" for a queued transfer, or "2 PERIODIC" when
+/// there is none of them.
+fn send_inform(
+    cfg: &FakeConfig,
+    model: &mut VirtualModel,
+    rt: &InterfaceRuntime,
+    extra_events: &[&str],
+    retry_count: u32,
+    audit: &AuditLogger,
+) -> io::Result<AcsHttpClient> {
     if cfg.acs_url.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -196,7 +264,8 @@ pub fn run_cwmp_session(
     )?;
 
     let mut events = model.pending.events.clone();
-    if let Some(ev) = extra_event {
+    let transfer_event = (!model.pending.transfers.is_empty()).then_some("7 TRANSFER COMPLETE");
+    for ev in extra_events.iter().copied().chain(transfer_event) {
         if !events.iter().any(|e| e.event_code == ev) {
             events.push(PendingEvent {
                 event_code: ev.to_owned(),
@@ -228,25 +297,40 @@ pub fn run_cwmp_session(
     };
     let _ = model.update_runtime_endpoints(runtime_conn_url, rt.ipv4_addrs.first().copied());
 
-    let inform_xml = build_inform("1", model, &events, &conn_req_url, 0);
+    let inform_xml = build_inform("1", model, &events, &conn_req_url, retry_count);
     audit.record(
         "INFO",
         "cwmp",
         &format!(
-            "Sending Inform to {} events={:?}",
+            "Sending Inform to {} events={:?} retry_count={retry_count}",
             cfg.acs_url,
             events.iter().map(|e| e.event_code.as_str()).collect::<Vec<_>>()
         ),
     );
     let resp = client.post_cwmp(&inform_xml, Some("urn:dslforum-org:cwmp-1-0#Inform"))?;
-    if resp.status < 200 || resp.status >= 300 {
+    if !(200..300).contains(&resp.status) {
         return Err(io::Error::other(format!(
             "ACS rejected Inform with HTTP {}",
             resp.status
         )));
     }
-    let _ = model.consume_pending_events();
+    if let Some(fault) = acs_fault(&resp.body) {
+        return Err(io::Error::other(format!(
+            "ACS answered Inform with fault {fault}"
+        )));
+    }
+    Ok(client)
+}
 
+/// Delivers the queued TransferComplete calls, then answers the requests of the ACS until
+/// it ends the session.
+fn serve_acs(
+    client: &mut AcsHttpClient,
+    cfg: &mut FakeConfig,
+    model: &mut VirtualModel,
+    audit: &AuditLogger,
+    conn_creds: Option<&Arc<Mutex<ConnReqCreds>>>,
+) -> io::Result<SessionSummary> {
     while let Some(tr) = model.pending.transfers.first().cloned() {
         let tc_xml = build_transfer_complete("tc-1", &tr);
         audit.record(
@@ -255,11 +339,20 @@ pub fn run_cwmp_session(
             &format!("Sending TransferComplete command_key={}", tr.command_key),
         );
         let tc_resp = client.post_cwmp(&tc_xml, Some("urn:dslforum-org:cwmp-1-0#TransferComplete"))?;
-        if tc_resp.status >= 200 && tc_resp.status < 300 {
-            let _ = model.consume_pending_transfer();
-        } else {
-            break;
+        if !(200..300).contains(&tc_resp.status) {
+            return Err(io::Error::other(format!(
+                "ACS rejected TransferComplete with HTTP {}",
+                tc_resp.status
+            )));
         }
+        if let Some(fault) = acs_fault(&tc_resp.body) {
+            return Err(io::Error::other(format!(
+                "ACS answered TransferComplete with fault {fault}"
+            )));
+        }
+        model
+            .consume_pending_transfer()
+            .map_err(|e| io::Error::other(format!("cannot save pending transfers: {e}")))?;
     }
 
     let mut summary = SessionSummary::default();

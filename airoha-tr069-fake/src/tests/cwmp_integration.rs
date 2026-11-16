@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use airoha_tr069_fake::audit::{redact_secrets, AuditLogger};
 use airoha_tr069_fake::config::{parse_omci_export_json, DownloadMapping, FakeConfig};
 use airoha_tr069_fake::crypto_tls::{md5_hex, sha256_hex};
-use airoha_tr069_fake::cwmp::{dispatch_rpc, parse_cwmp_envelope, xml_unescape};
+use airoha_tr069_fake::cwmp::{dispatch_rpc, parse_cwmp_envelope, xml_unescape, CwmpMessage};
 use airoha_tr069_fake::http::{
     build_digest_authorization, parse_digest_challenge, read_http_response,
     verify_digest_authorization, ConnReqCreds, ConnectionRequestServer, MAX_HTTP_BODY_BYTES,
@@ -25,7 +25,8 @@ use airoha_tr069_fake::net_iso::{
 };
 use airoha_tr069_fake::{
     apply_effects_to_config, apply_overlay_from_config, dump_sanitized_model_json,
-    dump_sanitized_status_json, load_effective_cfg_and_model, run_cwmp_session,
+    dump_sanitized_status_json, load_effective_cfg_and_model, retry_wait_secs,
+    run_cwmp_session,
 };
 use serde_json::Value as JsonValue;
 
@@ -369,7 +370,7 @@ fn test_end_to_end_cwmp_session_with_mock_acs_digest_and_cookies() {
     let mut model = VirtualModel::load_or_init(&cfg).unwrap();
     let audit = AuditLogger::new(&cfg.audit_log_path);
     let rt = InterfaceRuntime::default();
-    let summary = run_cwmp_session(&mut cfg, &mut model, &rt, None, &audit, None).unwrap();
+    let summary = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap();
     assert_eq!(summary.rpcs_handled, 1);
     assert_eq!(cfg.periodic_inform_interval, 300);
     assert_eq!(
@@ -578,7 +579,7 @@ fn test_session_has_no_rpc_cap_and_faults_unsupported_methods() {
     let rt = InterfaceRuntime::default();
     let audit = AuditLogger::new(dir.join("audit.log"));
 
-    let summary = run_cwmp_session(&mut cfg, &mut model, &rt, None, &audit, None).unwrap();
+    let summary = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap();
     assert_eq!(summary.rpcs_handled, 41);
     srv.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
@@ -614,10 +615,185 @@ fn test_session_ends_after_repeated_malformed_soap() {
     let rt = InterfaceRuntime::default();
     let audit = AuditLogger::new(dir.join("audit.log"));
 
-    let err = run_cwmp_session(&mut cfg, &mut model, &rt, None, &audit, None).unwrap_err();
+    let err = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap_err();
     assert!(err.to_string().contains("malformed SOAP"), "unexpected err: {err}");
     srv.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_download_boots_and_reports_transfer_complete_in_the_next_session() {
+    let dir = temp_dir("download");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let srv = std::thread::spawn(move || {
+        // Session 1: the ACS orders the download.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_http_request(&mut stream).unwrap();
+        stream.write_all(inform_response_http().as_bytes()).unwrap();
+        let (_, empty) = read_http_request(&mut stream).unwrap();
+        assert!(empty.is_empty());
+        let download = "<cwmp:Download><CommandKey>dl-7</CommandKey><FileType>1 Firmware Upgrade Image</FileType><URL>http://acs.example.invalid/images/fw-v2.0.0.bin</URL></cwmp:Download>";
+        stream
+            .write_all(acs_request_http("d1", download).as_bytes())
+            .unwrap();
+        let (_, reply) = read_http_request(&mut stream).unwrap();
+        assert!(reply.contains("<Status>1</Status>"), "{reply}");
+        assert!(reply.contains("<StartTime>0001-01-01T00:00:00Z</StartTime>"), "{reply}");
+        assert!(reply.contains("<CompleteTime>0001-01-01T00:00:00Z</CompleteTime>"), "{reply}");
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        drop(stream);
+
+        // Session 2: the boot Inform, then TransferComplete.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (_, inform) = read_http_request(&mut stream).unwrap();
+        for code in ["1 BOOT", "7 TRANSFER COMPLETE", "M Download"] {
+            assert!(
+                inform.contains(&format!("<EventCode>{code}</EventCode>")),
+                "{code}: {inform}"
+            );
+        }
+        assert!(inform.contains("<CommandKey>dl-7</CommandKey>"), "{inform}");
+        assert!(inform.contains("NNRRWrt-2.0.0"), "{inform}");
+        stream.write_all(inform_response_http().as_bytes()).unwrap();
+        let (_, tc) = read_http_request(&mut stream).unwrap();
+        assert!(tc.contains("<cwmp:TransferComplete>"), "{tc}");
+        assert!(tc.contains("<CommandKey>dl-7</CommandKey>"), "{tc}");
+        assert!(tc.contains("<FaultCode>0</FaultCode>"), "{tc}");
+        stream
+            .write_all(acs_request_http("1", "<cwmp:TransferCompleteResponse/>").as_bytes())
+            .unwrap();
+        let (_, empty) = read_http_request(&mut stream).unwrap();
+        assert!(empty.is_empty());
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = format!("http://{addr}/acs");
+    cfg.download_mappings.push(DownloadMapping {
+        pattern: "fw-v2.0.0.bin".to_owned(),
+        file_type: "1 Firmware Upgrade Image".to_owned(),
+        target_version: "NNRRWrt-2.0.0".to_owned(),
+    });
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let boot_epoch = model.pending.virtual_boot_epoch;
+    let rt = InterfaceRuntime::default();
+    let audit = AuditLogger::new(dir.join("audit.log"));
+
+    let first =
+        run_cwmp_session(&mut cfg, &mut model, &rt, &["2 PERIODIC"], 0, &audit, None).unwrap();
+    assert!(first.virtual_reboot_requested);
+    assert_eq!(model.pending.virtual_boot_epoch, boot_epoch + 1);
+    assert_eq!(model.pending.transfers.len(), 1);
+    assert_eq!(model.pending.events.len(), 3);
+
+    let second = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap();
+    assert!(!second.virtual_reboot_requested);
+    assert!(model.pending.events.is_empty());
+    assert!(model.pending.transfers.is_empty());
+    let reloaded = VirtualModel::load_or_init(&cfg).unwrap();
+    assert!(reloaded.pending.events.is_empty());
+    assert!(reloaded.pending.transfers.is_empty());
+    srv.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_failed_inform_keeps_events_and_the_retry_reports_its_count() {
+    let dir = temp_dir("retry");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let srv = std::thread::spawn(move || {
+        // Attempt 1: the ACS answers the Inform with a fault.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (_, inform) = read_http_request(&mut stream).unwrap();
+        assert!(inform.contains("<RetryCount>0</RetryCount>"), "{inform}");
+        assert!(inform.contains("<EventCode>0 BOOTSTRAP</EventCode>"), "{inform}");
+        let fault = "<SOAP-ENV:Fault><faultcode>Server</faultcode><faultstring>CWMP fault</faultstring><detail><cwmp:Fault><FaultCode>8005</FaultCode><FaultString>Retry request</FaultString></cwmp:Fault></detail></SOAP-ENV:Fault>";
+        stream
+            .write_all(acs_request_http("1", fault).as_bytes())
+            .unwrap();
+        drop(stream);
+
+        // Attempt 2: the Inform passes, the session breaks afterwards.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (_, inform) = read_http_request(&mut stream).unwrap();
+        assert!(inform.contains("<RetryCount>1</RetryCount>"), "{inform}");
+        assert!(inform.contains("<EventCode>0 BOOTSTRAP</EventCode>"), "{inform}");
+        assert!(inform.contains("<EventCode>M Reboot</EventCode>"), "{inform}");
+        assert!(inform.contains("<EventCode>1 BOOT</EventCode>"), "{inform}");
+        stream.write_all(inform_response_http().as_bytes()).unwrap();
+        let _ = read_http_request(&mut stream).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+    });
+
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = format!("http://{addr}/acs");
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    model.handle_reboot("rb-9").unwrap();
+    let rt = InterfaceRuntime::default();
+    let audit = AuditLogger::new(dir.join("audit.log"));
+
+    let err = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap_err();
+    assert!(!err.inform_accepted);
+    assert!(err.to_string().contains("8005 Retry request"), "unexpected err: {err}");
+    // A new model queues "0 BOOTSTRAP"; the reboot adds "M Reboot" and "1 BOOT".
+    assert_eq!(model.pending.events.len(), 3);
+
+    let err = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 1, &audit, None).unwrap_err();
+    assert!(err.inform_accepted);
+    assert!(err.to_string().contains("HTTP 500"), "unexpected err: {err}");
+    assert!(model.pending.events.is_empty());
+    srv.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_retry_wait_doubles_from_five_seconds_and_stops_at_the_tenth_step() {
+    assert_eq!(retry_wait_secs(1, 0), 5);
+    assert_eq!(retry_wait_secs(1, 4), 9);
+    assert_eq!(retry_wait_secs(1, 5), 5);
+    assert_eq!(retry_wait_secs(2, 0), 10);
+    assert_eq!(retry_wait_secs(2, 19), 19);
+    assert_eq!(retry_wait_secs(10, 0), 2560);
+    assert_eq!(retry_wait_secs(10, 2559), 5119);
+    assert_eq!(retry_wait_secs(11, 0), 2560);
+    assert_eq!(retry_wait_secs(0, 0), 5);
+    assert!((2560..5120).contains(&retry_wait_secs(u32::MAX, u64::MAX)));
+}
+
+#[test]
+fn test_acs_fault_reports_the_cwmp_fault_code() {
+    let with_detail = r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:cwmp="urn:dslforum-org:cwmp-1-0"><SOAP-ENV:Body><SOAP-ENV:Fault><faultcode>Server</faultcode><faultstring>CWMP fault</faultstring><detail><cwmp:Fault><FaultCode>8005</FaultCode><FaultString>Retry request</FaultString></cwmp:Fault></detail></SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
+    assert_eq!(
+        parse_cwmp_envelope(with_detail).unwrap().message,
+        CwmpMessage::Fault {
+            code: "8005".to_owned(),
+            message: "Retry request".to_owned(),
+        }
+    );
+    let bare = r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><SOAP-ENV:Fault><faultcode>Server</faultcode><faultstring>busy</faultstring></SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
+    assert_eq!(
+        parse_cwmp_envelope(bare).unwrap().message,
+        CwmpMessage::Fault {
+            code: "Server".to_owned(),
+            message: "busy".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -675,7 +851,7 @@ fn test_cwmp_session_errors_on_empty_500_and_reuses_basic_auth() {
     let rt = InterfaceRuntime::default();
     let audit = AuditLogger::new(dir.join("audit.log"));
 
-    let err = run_cwmp_session(&mut cfg, &mut model, &rt, Some("1 BOOT"), &audit, None).unwrap_err();
+    let err = run_cwmp_session(&mut cfg, &mut model, &rt, &["1 BOOT"], 0, &audit, None).unwrap_err();
     assert!(err.to_string().contains("HTTP 500"), "unexpected err: {err}");
     srv.join().unwrap();
     let captured = auth_headers.lock().unwrap();

@@ -653,16 +653,23 @@ impl VirtualModel {
         Ok(())
     }
 
-    pub fn handle_reboot(&mut self, command_key: &str) -> Result<(), CwmpFault> {
-        self.pending.virtual_boot_epoch += 1;
+    /// Queues an event for the next Inform. A numbered event occurs once per Inform,
+    /// an "M ..." event once per command.
+    fn queue_event(&mut self, event_code: &str, command_key: &str) {
+        let single = !event_code.starts_with("M ");
+        if single && self.pending.events.iter().any(|e| e.event_code == event_code) {
+            return;
+        }
         self.pending.events.push(PendingEvent {
-            event_code: "M Reboot".to_owned(),
+            event_code: event_code.to_owned(),
             command_key: command_key.to_owned(),
         });
-        self.pending.events.push(PendingEvent {
-            event_code: "1 BOOT".to_owned(),
-            command_key: String::new(),
-        });
+    }
+
+    pub fn handle_reboot(&mut self, command_key: &str) -> Result<(), CwmpFault> {
+        self.pending.virtual_boot_epoch += 1;
+        self.queue_event("M Reboot", command_key);
+        self.queue_event("1 BOOT", "");
         self.save_pending()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))
     }
@@ -670,10 +677,7 @@ impl VirtualModel {
     pub fn handle_factory_reset(&mut self) -> Result<(), CwmpFault> {
         self.reset_virtual()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
-        self.pending.events.push(PendingEvent {
-            event_code: "1 BOOT".to_owned(),
-            command_key: String::new(),
-        });
+        self.queue_event("1 BOOT", "");
         self.save_pending()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))
     }
@@ -716,30 +720,47 @@ impl VirtualModel {
             complete_time: ts,
         };
         self.pending.transfers.push(transfer.clone());
-        self.pending.events.push(PendingEvent {
-            event_code: "7 TRANSFER COMPLETE".to_owned(),
-            command_key: String::new(),
-        });
-        self.pending.events.push(PendingEvent {
-            event_code: "M Download".to_owned(),
-            command_key: command_key.to_owned(),
-        });
+        // The mapped image replaces the firmware, so the virtual CPE boots into it.
+        self.pending.virtual_boot_epoch += 1;
+        self.queue_event("1 BOOT", "");
+        self.queue_event("7 TRANSFER COMPLETE", "");
+        self.queue_event("M Download", command_key);
         self.save_pending()
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
         Ok(transfer)
     }
 
+    /// Drops the events an InformResponse delivers. "7 TRANSFER COMPLETE" and "M Download"
+    /// stay queued until the TransferCompleteResponse of their transfer arrives.
     pub fn consume_pending_events(&mut self) -> Result<(), String> {
-        self.pending.events.clear();
+        let transfer_pending = !self.pending.transfers.is_empty();
+        let queued = self.pending.events.len();
+        self.pending
+            .events
+            .retain(|e| transfer_pending && is_transfer_event(&e.event_code));
+        if self.pending.events.len() == queued {
+            return Ok(());
+        }
         self.save_pending()
     }
 
     pub fn consume_pending_transfer(&mut self) -> Result<(), String> {
-        if !self.pending.transfers.is_empty() {
-            self.pending.transfers.remove(0);
-            self.save_pending()?;
+        if self.pending.transfers.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let done = self.pending.transfers.remove(0);
+        if let Some(pos) = self
+            .pending
+            .events
+            .iter()
+            .position(|e| e.event_code == "M Download" && e.command_key == done.command_key)
+        {
+            self.pending.events.remove(pos);
+        }
+        if self.pending.transfers.is_empty() {
+            self.pending.events.retain(|e| !is_transfer_event(&e.event_code));
+        }
+        self.save_pending()
     }
 
     pub fn save_template(&self) -> Result<(), String> {
@@ -755,6 +776,10 @@ impl VirtualModel {
         pretty.push('\n');
         atomic_write_string(&self.events_path, &pretty)
     }
+}
+
+fn is_transfer_event(event_code: &str) -> bool {
+    matches!(event_code, "7 TRANSFER COMPLETE" | "M Download")
 }
 
 fn build_initial_template(cfg: &FakeConfig) -> BTreeMap<String, ParamEntry> {
