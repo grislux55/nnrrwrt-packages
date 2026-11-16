@@ -2,17 +2,15 @@
 	"luci-app-tr069-fake": {
 		"description": "Grant access to dual-stack isolated TR-069 Fake configuration and virtual model",
 		"read": {
-			"uci": [ "tr069_fake", "network", "pon" ],
+			"uci": [ "tr069_fake" ],
 			"ubus": {
-				"file": [ "exec", "read" ],
-				"network.device": [ "status" ],
+				"file": [ "exec" ],
 				"network.interface": [ "dump" ]
 			},
 			"file": {
 				"/usr/libexec/tr069-fake-ctl status": [ "exec" ],
 				"/usr/libexec/tr069-fake-ctl model": [ "exec" ],
-				"/usr/libexec/tr069-fake-ctl logs": [ "exec" ],
-				"/tmp/tr069-fake.log": [ "read" ]
+				"/usr/libexec/tr069-fake-ctl logs": [ "exec" ]
 			}
 		},
 		"write": {
@@ -23,7 +21,6 @@
 			"file": {
 				"/usr/libexec/tr069-fake-ctl trigger-inform": [ "exec" ],
 				"/usr/libexec/tr069-fake-ctl reset-virtual": [ "exec" ],
-				"/usr/libexec/tr069-fake-ctl apply-overlay": [ "exec" ],
 				"/usr/libexec/tr069-fake-ctl clear-log": [ "exec" ]
 			}
 		}

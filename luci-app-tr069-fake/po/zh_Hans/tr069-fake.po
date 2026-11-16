@@ -86,8 +86,8 @@ msgstr "重置虚拟状态失败"
 msgid "Initial Template vs Persisted Virtual Model"
 msgstr "初始模板与当前持久化虚拟模型对照"
 
-msgid "Passwords are masked. Modified values reflect last-write-wins updates from either ACS SetParameterValues or LuCI."
-msgstr "密码字段已隐藏；加粗项为经 ACS SetParameterValues 或 LuCI 修改后的当前虚拟值。"
+msgid "Passwords, WLAN keys and subscriber accounts are masked. Modified values reflect last-write-wins updates from either ACS SetParameterValues or LuCI."
+msgstr "密码、WLAN 密钥与用户账号已隐藏；加粗项为经 ACS SetParameterValues 或 LuCI 修改后的当前虚拟值。"
 
 msgid "Parameter Path"
 msgstr "参数路径"

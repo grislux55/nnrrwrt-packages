@@ -147,7 +147,7 @@ return view.extend({
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('Initial Template vs Persisted Virtual Model')),
 			E('div', { 'class': 'cbi-section-descr' },
-				_('Passwords are masked. Modified values reflect last-write-wins updates from either ACS SetParameterValues or LuCI.')),
+				_('Passwords, WLAN keys and subscriber accounts are masked. Modified values reflect last-write-wins updates from either ACS SetParameterValues or LuCI.')),
 			E('div', { 'style': 'max-height: 320px; overflow-y: auto;' }, [
 				E('table', { 'class': 'table' }, [
 					E('tr', { 'class': 'tr table-titles' }, [
