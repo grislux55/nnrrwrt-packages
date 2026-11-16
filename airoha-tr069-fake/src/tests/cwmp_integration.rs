@@ -26,7 +26,7 @@ use airoha_tr069_fake::net_iso::{
 use airoha_tr069_fake::{
     apply_effects_to_config, apply_overlay_from_config, dump_sanitized_model_json,
     dump_sanitized_status_json, load_effective_cfg_and_model, retry_wait_secs,
-    run_cwmp_session,
+    run_cwmp_session, RuntimeEndpoints,
 };
 use serde_json::Value as JsonValue;
 
@@ -1172,6 +1172,198 @@ fn test_uptime_counts_from_the_last_virtual_boot() {
     });
     assert_eq!(reported(&model), 0);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_session_follows_redirects_and_keeps_the_configured_acs_url() {
+    let dir = temp_dir("redirect");
+    let first = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = TcpListener::bind("127.0.0.2:0").unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second_addr = second.local_addr().unwrap();
+
+    let srv = std::thread::spawn(move || {
+        // The configured ACS hands the session to another host.
+        let (mut stream, _) = first.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (hdrs, inform) = read_http_request(&mut stream).unwrap();
+        assert!(hdrs.starts_with("POST /acs HTTP/1.1\r\n"), "{hdrs}");
+        let moved = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{second_addr}/acs2\r\nSet-Cookie: first=1\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream.write_all(moved.as_bytes()).unwrap();
+        drop(stream);
+
+        // The same Inform arrives there, without the cookie of the first host.
+        let (mut stream, _) = second.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (hdrs, body) = read_http_request(&mut stream).unwrap();
+        assert!(hdrs.starts_with("POST /acs2 HTTP/1.1\r\n"), "{hdrs}");
+        assert!(hdrs.contains(&format!("Host: {second_addr}\r\n")), "{hdrs}");
+        assert!(!hdrs.contains("Cookie:"), "{hdrs}");
+        assert_eq!(body, inform);
+        stream
+            .write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: acs3?node=2\r\nSet-Cookie: second=2\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        drop(stream);
+
+        // A relative Location stays on the host, which keeps its cookie.
+        let (mut stream, _) = second.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (hdrs, body) = read_http_request(&mut stream).unwrap();
+        assert!(hdrs.starts_with("POST /acs3?node=2 HTTP/1.1\r\n"), "{hdrs}");
+        assert!(hdrs.contains("Cookie: second=2"), "{hdrs}");
+        assert_eq!(body, inform);
+        stream.write_all(inform_response_http().as_bytes()).unwrap();
+        let (hdrs, body) = read_http_request(&mut stream).unwrap();
+        assert!(hdrs.starts_with("POST /acs3?node=2 HTTP/1.1\r\n"), "{hdrs}");
+        assert!(body.is_empty(), "{body}");
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = format!("http://{first_addr}/acs");
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let rt = InterfaceRuntime::default();
+    let audit = AuditLogger::new(dir.join("audit.log"));
+
+    let summary = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap();
+    assert_eq!(summary.rpcs_handled, 0);
+    srv.join().unwrap();
+
+    // A redirect serves one session: the configured URL stays.
+    assert_eq!(cfg.acs_url, format!("http://{first_addr}/acs"));
+    assert_eq!(
+        model.get_value("InternetGatewayDevice.ManagementServer.URL"),
+        Some(cfg.acs_url.as_str())
+    );
+    let entries = audit.snapshot().join("\n");
+    for path in ["acs2", "acs3"] {
+        let line = format!("ACS redirected the session to http://{second_addr}/{path}");
+        assert!(entries.contains(&line), "{entries}");
+    }
+    assert!(!entries.contains("node=2"), "{entries}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_session_ends_at_the_sixth_redirect() {
+    let dir = temp_dir("redirect-loop");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let srv = std::thread::spawn(move || {
+        for request in 0..6 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (hdrs, _) = read_http_request(&mut stream).unwrap();
+            let path = if request == 0 { "/acs" } else { "/loop" };
+            assert!(hdrs.starts_with(&format!("POST {path} HTTP/1.1\r\n")), "{hdrs}");
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        }
+    });
+
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = format!("http://{addr}/acs");
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let rt = InterfaceRuntime::default();
+    let audit = AuditLogger::new(dir.join("audit.log"));
+
+    let err = run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None).unwrap_err();
+    assert!(!err.inform_accepted);
+    assert!(err.to_string().contains("more than 5 times"), "unexpected err: {err}");
+    // The Inform was not accepted, so the event of the new model stays queued.
+    assert_eq!(model.pending.events.len(), 1);
+    srv.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_acs_url_change_queues_bootstrap() {
+    fn set_url(model: &mut VirtualModel, url: &str) {
+        model
+            .set_parameter_values(
+                &[("InternetGatewayDevice.ManagementServer.URL".to_owned(), url.to_owned(), None)],
+                "k1",
+            )
+            .unwrap();
+    }
+
+    let dir = temp_dir("url-change");
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    cfg.acs_url = "http://acs1.example.invalid:9090/acs".to_owned();
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    model.apply_config_overlay(&cfg).unwrap();
+    // A new state directory starts with "0 BOOTSTRAP": take it as delivered.
+    model.consume_pending_events().unwrap();
+    assert!(model.pending.events.is_empty());
+
+    // The same URL, also in another letter case, is no change.
+    set_url(&mut model, "http://acs1.example.invalid:9090/acs");
+    set_url(&mut model, "http://ACS1.example.invalid:9090/acs");
+    assert!(model.pending.events.is_empty());
+
+    // Two changes before the next Inform make one event.
+    set_url(&mut model, "http://acs2.example.invalid:9090/acs");
+    set_url(&mut model, "http://acs3.example.invalid:9090/acs");
+    let events: Vec<&str> = model
+        .pending
+        .events
+        .iter()
+        .map(|ev| ev.event_code.as_str())
+        .collect();
+    assert_eq!(events, ["0 BOOTSTRAP"]);
+    let mut reloaded = VirtualModel::load_or_init(&cfg).unwrap();
+    assert_eq!(reloaded.pending.events, model.pending.events);
+
+    // The local settings: unchanged ones leave the URL of the ACS, a new URL replaces it.
+    reloaded.consume_pending_events().unwrap();
+    reloaded.apply_config_overlay(&cfg).unwrap();
+    assert!(reloaded.pending.events.is_empty());
+    cfg.acs_url = "http://acs-from-luci.example.invalid/acs".to_owned();
+    reloaded.apply_config_overlay(&cfg).unwrap();
+    assert_eq!(
+        reloaded.get_value("InternetGatewayDevice.ManagementServer.URL"),
+        Some("http://acs-from-luci.example.invalid/acs")
+    );
+    assert_eq!(reloaded.pending.events.len(), 1);
+    assert_eq!(reloaded.pending.events[0].event_code, "0 BOOTSTRAP");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_runtime_endpoints_differ_by_the_values_the_interface_offers() {
+    let mut cfg = FakeConfig::default();
+    cfg.conn_req_enable = true;
+    let mut rt = InterfaceRuntime::default();
+    rt.ipv4_addrs = vec![Ipv4Addr::new(10, 46, 0, 23)];
+    let reported = RuntimeEndpoints::of(&cfg, &rt);
+    assert_eq!(reported.conn_req_url.as_deref(), Some("http://10.46.0.23:7547/tr069"));
+    assert_eq!(reported.ipv4, Some(Ipv4Addr::new(10, 46, 0, 23)));
+    assert!(!reported.differs_from(&reported));
+
+    rt.ipv4_addrs = vec![Ipv4Addr::new(10, 46, 0, 24)];
+    assert!(RuntimeEndpoints::of(&cfg, &rt).differs_from(&reported));
+
+    // Without an address the data model keeps what was reported.
+    rt.ipv4_addrs.clear();
+    let without_addr = RuntimeEndpoints::of(&cfg, &rt);
+    assert_eq!(without_addr, RuntimeEndpoints { conn_req_url: None, ipv4: None });
+    assert!(!without_addr.differs_from(&reported));
+    assert!(reported.differs_from(&without_addr));
+
+    // A disabled listener reports an empty URL.
+    cfg.conn_req_enable = false;
+    let disabled = RuntimeEndpoints::of(&cfg, &rt);
+    assert_eq!(disabled.conn_req_url.as_deref(), Some(""));
+    assert!(disabled.differs_from(&reported));
 }
 
 #[test]

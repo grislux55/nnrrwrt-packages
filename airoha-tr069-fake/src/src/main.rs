@@ -21,7 +21,7 @@ use airoha_tr069_fake::net_iso::InterfaceRuntime;
 use airoha_tr069_fake::{
     apply_effects_to_config, apply_overlay_from_config, dump_sanitized_model_json,
     dump_sanitized_status_json, load_effective_cfg_and_model, load_raw_cfg_and_model,
-    retry_wait_secs, run_cwmp_session,
+    retry_wait_secs, run_cwmp_session, RuntimeEndpoints,
 };
 use serde_json::json;
 
@@ -322,6 +322,18 @@ fn owe_event(owed: &mut Vec<&'static str>, event_code: &'static str) {
     }
 }
 
+/// Owes "4 VALUE CHANGE" when the interface offers a ConnectionRequestURL or an address
+/// that the last accepted Inform did not carry.
+fn owe_value_change(
+    owed: &mut Vec<&'static str>,
+    reported: Option<&RuntimeEndpoints>,
+    current: &RuntimeEndpoints,
+) {
+    if reported.is_some_and(|reported| current.differs_from(reported)) {
+        owe_event(owed, "4 VALUE CHANGE");
+    }
+}
+
 fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
     let (mut base_cfg, mut model) = match load_raw_cfg_and_model(config_path) {
         Ok(v) => v,
@@ -369,6 +381,8 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
     let mut owed_events: Vec<&'static str> = vec!["1 BOOT"];
     let mut retry = RetryState::default();
     let mut reboot_until: Option<Instant> = None;
+    // What the last accepted Inform reported about the interface.
+    let mut reported_endpoints: Option<RuntimeEndpoints> = None;
     let daemon_started = Instant::now();
     let mut last_inform = Instant::now();
     let mut last_poll_check = Instant::now();
@@ -439,6 +453,11 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                 }
                 state_changed = true;
             }
+            owe_value_change(
+                &mut owed_events,
+                reported_endpoints.as_ref(),
+                &RuntimeEndpoints::of(&cfg, &active_rt),
+            );
 
             if state_changed {
                 update_status_snapshot(&status_snapshot, &cfg, &active_rt, &model);
@@ -482,6 +501,9 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                 }
                 conn_srv = maybe_start_conn_req(&cfg, &active_rt, &conn_creds, &conn_req_trigger, &audit);
             }
+            // What the Inform of this session reports.
+            let endpoints = RuntimeEndpoints::of(&cfg, &active_rt);
+            owe_value_change(&mut owed_events, reported_endpoints.as_ref(), &endpoints);
             match run_cwmp_session(
                 &mut cfg,
                 &mut model,
@@ -496,6 +518,7 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                     retry = RetryState::default();
                     reboot_until = None;
                     last_inform = Instant::now();
+                    reported_endpoints = Some(endpoints);
                     audit.record(
                         "INFO",
                         "cwmp",
@@ -518,6 +541,7 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
                     if e.inform_accepted {
                         owed_events.clear();
                         last_inform = Instant::now();
+                        reported_endpoints = Some(endpoints);
                     } else {
                         // A connection request event is not delivered again.
                         owed_events.retain(|ev| *ev != "6 CONNECTION REQUEST");

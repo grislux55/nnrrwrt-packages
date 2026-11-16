@@ -33,6 +33,8 @@ const CONN_REQ_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const ACS_USER_AGENT: &str = "TR069 Client 1.0";
 const CONN_REQ_REALM: &str = "TR069 Client";
 const CONN_REQ_SERVER: &str = "TR069 client TCP connection request Server";
+/// Redirects one session follows, as the stock client.
+const MAX_SESSION_REDIRECTS: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UrlParts {
@@ -40,6 +42,35 @@ pub struct UrlParts {
     pub host: String,
     pub port: u16,
     pub path_query: String,
+}
+
+impl UrlParts {
+    fn scheme(&self) -> &'static str {
+        if self.is_https {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    /// The URL a Location header names, absolute or relative to this one.
+    fn resolve(&self, location: &str) -> Option<UrlParts> {
+        let base = format!(
+            "{}://{}:{}{}",
+            self.scheme(),
+            self.host,
+            self.port,
+            self.path_query
+        );
+        let target = Url::parse(&base).ok()?.join(location).ok()?;
+        parse_url(target.as_str()).ok()
+    }
+
+    /// The URL for a log line, without the query, which may hold a token.
+    fn without_query(&self) -> String {
+        let path = self.path_query.split('?').next().unwrap_or_default();
+        format!("{}://{}:{}{}", self.scheme(), self.host, self.port, path)
+    }
 }
 
 pub fn parse_url(url_str: &str) -> io::Result<UrlParts> {
@@ -142,6 +173,9 @@ pub struct AcsHttpClient {
     use_basic: bool,
     nonce_count: u32,
     stream: Option<TransportStream>,
+    /// Redirects followed in this session.
+    redirects: u32,
+    audit: AuditLogger,
 }
 
 impl AcsHttpClient {
@@ -151,6 +185,7 @@ impl AcsHttpClient {
         password: &str,
         insecure_tls: bool,
         rt: InterfaceRuntime,
+        audit: AuditLogger,
     ) -> io::Result<Self> {
         let url = parse_url(url_str)?;
         Ok(Self {
@@ -164,37 +199,88 @@ impl AcsHttpClient {
             use_basic: false,
             nonce_count: 0,
             stream: None,
+            redirects: 0,
+            audit,
         })
     }
 
     pub fn post_cwmp(&mut self, body: &str, soap_action: Option<&str>) -> io::Result<HttpResponse> {
-        let path_query = self.url.path_query.clone();
         let body_bytes = body.as_bytes();
-        for attempt in 0..3 {
+        // Challenges answered at the current URL.
+        let mut challenges = 0;
+        loop {
+            let path_query = self.url.path_query.clone();
             let auth_header = self.build_auth_header("POST", &path_query, body_bytes);
             let resp = self.send_once(body_bytes, soap_action, auth_header.as_deref())?;
-            if resp.status == 401 && attempt < 2 && !self.username.is_empty() {
+            if matches!(resp.status, 301 | 302 | 307) {
+                // The same message goes to the new URL.
+                self.follow_redirect(&resp)?;
+                challenges = 0;
+                continue;
+            }
+            if resp.status == 401 && challenges < 2 && !self.username.is_empty() {
                 if let Some(chal) = resp.headers.get("www-authenticate") {
                     if chal.trim_start().to_ascii_lowercase().starts_with("digest ") {
                         if let Some(parsed) = parse_digest_challenge(chal) {
                             self.use_basic = false;
                             self.digest = Some(parsed);
                             self.nonce_count = 0;
+                            challenges += 1;
                             continue;
                         }
                     } else if chal.trim_start().to_ascii_lowercase().starts_with("basic") {
                         self.digest = None;
                         self.use_basic = true;
+                        challenges += 1;
                         continue;
                     }
                 }
             }
             return Ok(resp);
         }
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "ACS authentication failed",
-        ))
+    }
+
+    /// Moves the rest of the session to the Location of a 301, 302 or 307 answer. The
+    /// stock client follows five redirects per session and authenticates anew at each
+    /// target. The configured ACS URL stays as it is. Rules of this client: an https
+    /// session stays on https, and cookies stay with the host that set them.
+    fn follow_redirect(&mut self, resp: &HttpResponse) -> io::Result<()> {
+        if self.redirects >= MAX_SESSION_REDIRECTS {
+            return Err(io::Error::other(format!(
+                "ACS redirected the session more than {MAX_SESSION_REDIRECTS} times"
+            )));
+        }
+        let location = resp
+            .headers
+            .get("location")
+            .filter(|location| !location.is_empty())
+            .ok_or_else(|| {
+                io::Error::other(format!("ACS sent HTTP {} without a Location", resp.status))
+            })?;
+        let target = self.url.resolve(location).ok_or_else(|| {
+            io::Error::other(format!(
+                "ACS sent HTTP {} with an unusable Location",
+                resp.status
+            ))
+        })?;
+        if self.url.is_https && !target.is_https {
+            return Err(io::Error::other("ACS redirected an https session to http"));
+        }
+        if !target.host.eq_ignore_ascii_case(&self.url.host) {
+            self.cookies.clear();
+        }
+        self.audit.record(
+            "INFO",
+            "cwmp",
+            &format!("ACS redirected the session to {}", target.without_query()),
+        );
+        self.redirects += 1;
+        self.stream = None;
+        self.digest = None;
+        self.use_basic = false;
+        self.nonce_count = 0;
+        self.url = target;
+        Ok(())
     }
 
     fn build_basic_header(&self) -> String {
@@ -1073,5 +1159,88 @@ fn digest_domain(path: &str) -> &str {
         path
     } else {
         "/"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn redirect(status: u16, location: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: BTreeMap::from([("location".to_owned(), location.to_owned())]),
+            set_cookies: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn location_resolves_against_the_session_url() {
+        let base = parse_url("https://acs.example.invalid:7547/cwmp/acs?token=1").unwrap();
+        let rel = base.resolve("node2?x=1").unwrap();
+        assert!(rel.is_https);
+        assert_eq!(rel.host, "acs.example.invalid");
+        assert_eq!(rel.port, 7547);
+        assert_eq!(rel.path_query, "/cwmp/node2?x=1");
+        assert_eq!(rel.without_query(), "https://acs.example.invalid:7547/cwmp/node2");
+
+        let abs = base.resolve("http://[2001:db8::1]:8080/a?b=c").unwrap();
+        assert!(!abs.is_https);
+        assert_eq!(abs.host, "[2001:db8::1]");
+        assert_eq!(abs.port, 8080);
+        assert_eq!(abs.path_query, "/a?b=c");
+        assert_eq!(
+            abs.resolve("/d").unwrap().without_query(),
+            "http://[2001:db8::1]:8080/d"
+        );
+        assert!(base.resolve("ftp://acs.example.invalid/").is_none());
+    }
+
+    #[test]
+    fn redirect_stays_on_https_and_drops_cookies_of_another_host() {
+        let log = std::path::PathBuf::from(format!(
+            "/tmp/tr069-fake-test-redirect-{}.log",
+            std::process::id()
+        ));
+        let mut client = AcsHttpClient::new(
+            "https://acs.example.invalid/cwmp/acs?token=1",
+            "",
+            "",
+            false,
+            InterfaceRuntime::default(),
+            AuditLogger::new(&log),
+        )
+        .unwrap();
+        client.cookies.insert("SID".to_owned(), "1".to_owned());
+
+        client.follow_redirect(&redirect(307, "node2")).unwrap();
+        assert_eq!(client.url.path_query, "/cwmp/node2");
+        assert_eq!(client.cookies.len(), 1);
+
+        client
+            .follow_redirect(&redirect(302, "https://acs2.example.invalid:8443/acs"))
+            .unwrap();
+        assert_eq!(client.url.host, "acs2.example.invalid");
+        assert_eq!(client.url.port, 8443);
+        assert!(client.cookies.is_empty());
+
+        let err = client
+            .follow_redirect(&redirect(301, "http://acs2.example.invalid/acs"))
+            .unwrap_err();
+        assert!(err.to_string().contains("https session to http"), "{err}");
+        assert!(client.follow_redirect(&redirect(302, "")).is_err());
+        assert_eq!(client.redirects, 2);
+        assert_eq!(client.url.port, 8443);
+
+        let entries = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            entries.contains(
+                "ACS redirected the session to https://acs.example.invalid:443/cwmp/node2"
+            ),
+            "{entries}"
+        );
+        assert!(!entries.contains("token"), "{entries}");
+        let _ = std::fs::remove_file(&log);
     }
 }

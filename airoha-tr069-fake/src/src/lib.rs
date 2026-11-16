@@ -11,6 +11,7 @@ pub mod net_iso;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
@@ -39,6 +40,37 @@ const RETRY_MAX_STEPS: u32 = 10;
 pub fn retry_wait_secs(step: u32, random: u64) -> u64 {
     let base = RETRY_MIN_WAIT_SECS << (step.clamp(1, RETRY_MAX_STEPS) - 1);
     base + random % base
+}
+
+/// What an Inform reports about the management interface. A field is None while the
+/// interface offers no value; the data model then keeps the last one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeEndpoints {
+    /// Empty while the connection request listener is disabled.
+    pub conn_req_url: Option<String>,
+    pub ipv4: Option<Ipv4Addr>,
+}
+
+impl RuntimeEndpoints {
+    pub fn of(cfg: &FakeConfig, rt: &InterfaceRuntime) -> Self {
+        let conn_req_url = if cfg.conn_req_enable {
+            rt.conn_req_bind_addrs(cfg.conn_req_port)
+                .first()
+                .map(|sa| format!("http://{}{}", sa, cfg.conn_req_path))
+        } else {
+            Some(String::new())
+        };
+        Self {
+            conn_req_url,
+            ipv4: rt.ipv4_addrs.first().copied(),
+        }
+    }
+
+    /// True when an Inform sent now carries a value that `reported` did not.
+    pub fn differs_from(&self, reported: &Self) -> bool {
+        (self.conn_req_url.is_some() && self.conn_req_url != reported.conn_req_url)
+            || (self.ipv4.is_some() && self.ipv4 != reported.ipv4)
+    }
 }
 
 pub fn load_raw_cfg_and_model(config_path: &Path) -> Result<(FakeConfig, VirtualModel), String> {
@@ -267,6 +299,7 @@ fn send_inform(
         &cfg.acs_password,
         cfg.insecure_tls,
         rt.clone(),
+        audit.clone(),
     )?;
 
     let mut events = model.pending.events.clone();
@@ -286,24 +319,16 @@ fn send_inform(
         });
     }
 
-    let conn_req_url = if cfg.conn_req_enable {
-        rt.conn_req_bind_addrs(cfg.conn_req_port)
-            .first()
-            .map(|sa| format!("http://{}{}", sa, cfg.conn_req_path))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let runtime_conn_url = if !conn_req_url.is_empty() {
-        Some(conn_req_url.as_str())
-    } else if !cfg.conn_req_enable {
-        Some("")
-    } else {
-        None
-    };
-    let _ = model.update_runtime_endpoints(runtime_conn_url, rt.ipv4_addrs.first().copied());
+    let endpoints = RuntimeEndpoints::of(cfg, rt);
+    let _ = model.update_runtime_endpoints(endpoints.conn_req_url.as_deref(), endpoints.ipv4);
 
-    let inform_xml = build_inform(session_id, model, &events, &conn_req_url, retry_count);
+    let inform_xml = build_inform(
+        session_id,
+        model,
+        &events,
+        endpoints.conn_req_url.as_deref().unwrap_or_default(),
+        retry_count,
+    );
     audit.record(
         "INFO",
         "cwmp",

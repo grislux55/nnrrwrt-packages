@@ -269,6 +269,7 @@ impl VirtualModel {
                 return Ok(());
             }
         }
+        let acs_url = self.acs_url();
         for key in overlay_keys {
             if let Some(entry) = fresh.get(key) {
                 let should_apply = match &prev_sig_map {
@@ -300,6 +301,7 @@ impl VirtualModel {
                 add_ancestor_objects(&mut self.objects, k);
             }
         }
+        self.bootstrap_on_acs_url_change(&acs_url)?;
         self.save_model()?;
         save_overlay_sig(&sig_path, &new_sig_map)
     }
@@ -527,6 +529,7 @@ impl VirtualModel {
                 param_faults,
             });
         }
+        let acs_url = self.acs_url();
         let mut effects = ManagementEffects::default();
         for (name, val, _) in pairs {
             let normalized = normalize_value(
@@ -542,7 +545,9 @@ impl VirtualModel {
         if let Some(key) = parameter_key {
             self.set_parameter_key(key);
         }
-        self.save_model()
+        // The event is stored first: a failed write is then seen again as a URL change.
+        self.bootstrap_on_acs_url_change(&acs_url)
+            .and_then(|()| self.save_model())
             .map_err(|e| CwmpFault::simple(9002, format!("Internal error: {e}")))?;
         Ok(effects)
     }
@@ -711,6 +716,23 @@ impl VirtualModel {
             event_code: event_code.to_owned(),
             command_key: command_key.to_owned(),
         });
+    }
+
+    /// The ACS URL in effect: the TR-098 value, which the TR-181 one mirrors.
+    fn acs_url(&self) -> String {
+        self.get_value("InternetGatewayDevice.ManagementServer.URL")
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Queues "0 BOOTSTRAP" when the ACS URL is no longer `previous`. As in the stock
+    /// client the comparison ignores letter case.
+    fn bootstrap_on_acs_url_change(&mut self, previous: &str) -> Result<(), String> {
+        if self.acs_url().eq_ignore_ascii_case(previous) {
+            return Ok(());
+        }
+        self.queue_event("0 BOOTSTRAP", "");
+        self.save_pending()
     }
 
     pub fn handle_reboot(&mut self, command_key: &str) -> Result<(), CwmpFault> {
