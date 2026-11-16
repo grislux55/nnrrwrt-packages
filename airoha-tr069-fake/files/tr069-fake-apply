@@ -6,6 +6,10 @@
 
 ACTION="${1:-reload}"
 RUNTIME_JSON="/tmp/tr069-fake-runtime.json"
+# Sections this script owns in /etc/config/network and /etc/config/firewall.
+NET_SECTIONS="tr069_dev tr069 tr069_6"
+FW_SECTIONS="tr069_zone tr069_dhcpv6 tr069_icmpv6 tr069_connreq"
+# Set when a package was committed and its subsystem has to reload.
 NET_DIRTY=0
 FW_DIRTY=0
 
@@ -13,6 +17,16 @@ fail() {
 	logger -t tr069-fake "$*"
 	echo "tr069-fake: $*" >&2
 	exit 1
+}
+
+# Ends the run over a configuration that cannot be applied. The service does not start
+# then, so the sections it would use go as well.
+refuse() {
+	ENABLED=0
+	apply_network
+	apply_firewall
+	reload_subsystems
+	fail "$*"
 }
 
 validate_ifname() {
@@ -139,7 +153,7 @@ load_config() {
 	config_get SW_VER main software_version ""
 
 	[ "$ACTION" = "stop" ] && ENABLED=0
-	validate_pon_line "$PON_LINE" || fail "Invalid pon_line: $PON_LINE"
+	validate_pon_line "$PON_LINE" || refuse "Invalid pon_line: $PON_LINE"
 	validate_uint "$IP4TABLE" || IP4TABLE="169"
 	validate_uint "$IP6TABLE" || IP6TABLE="169"
 	if ! validate_uint "$PERIODIC_INT" || [ "$PERIODIC_INT" -lt 10 ]; then
@@ -163,38 +177,66 @@ load_config() {
 	[ -n "$EFF_ACS_USER" ] || EFF_ACS_USER="$OMCI_ACS_USER"
 	EFF_ACS_PASS="$ACS_PASS"
 	[ -n "$EFF_ACS_PASS" ] || EFF_ACS_PASS="$OMCI_ACS_PASS"
+
+	if [ "$ENABLED" -eq 1 ]; then
+		validate_ifname "$UPLINK" || refuse "Invalid uplink device: $UPLINK"
+		if [ -n "$EFF_VLAN" ]; then
+			validate_vlan "$EFF_VLAN" || refuse "Invalid management VLAN: $EFF_VLAN"
+		fi
+	fi
 }
 
-remove_managed_network() {
-	local sec
-	for sec in tr069_dev tr069 tr069_6 tr069_rule4 tr069_rule6; do
-		if uci -q get "network.$sec" >/dev/null; then
-			uci -q delete "network.$sec" && NET_DIRTY=1
-		fi
+# Prints the managed sections of a package, staged changes included.
+show_managed() {
+	local pkg="$1" sec
+	shift
+	for sec in "$@"; do
+		uci -q show "$pkg.$sec"
 	done
 }
 
-remove_managed_firewall() {
-	local sec
-	for sec in tr069_zone tr069_dhcpv6 tr069_icmpv6 tr069_connreq; do
-		if uci -q get "firewall.$sec" >/dev/null; then
-			uci -q delete "firewall.$sec" && FW_DIRTY=1
-		fi
+# Drops the staged changes of the managed sections.
+revert_managed() {
+	local pkg="$1" sec
+	shift
+	for sec in "$@"; do
+		uci -q revert "$pkg.$sec"
 	done
+}
+
+remove_managed() {
+	local pkg="$1" sec
+	shift
+	for sec in "$@"; do
+		uci -q delete "$pkg.$sec"
+	done
+}
+
+# Commits the staged sections when they differ from $2, their committed content.
+# Returns 1 with the staging dropped when they are equal: the file stays as it is and
+# the subsystem needs no reload.
+commit_managed() {
+	local pkg="$1" before="$2"
+	shift 2
+	if [ "$(show_managed "$pkg" "$@")" = "$before" ]; then
+		revert_managed "$pkg" "$@"
+		return 1
+	fi
+	uci commit "$pkg" || fail "Failed to commit $pkg config"
 }
 
 apply_network() {
-	local target_dev
+	local target_dev before
 
-	remove_managed_network
+	# What an interrupted run left staged would pass for committed content.
+	revert_managed network $NET_SECTIONS
+	before="$(show_managed network $NET_SECTIONS)"
+	remove_managed network $NET_SECTIONS
 
 	if [ "$ENABLED" -eq 1 ]; then
-		NET_DIRTY=1
-		validate_ifname "$UPLINK" || fail "Invalid uplink device: $UPLINK"
 		target_dev="$UPLINK"
 
 		if [ -n "$EFF_VLAN" ]; then
-			validate_vlan "$EFF_VLAN" || fail "Invalid management VLAN: $EFF_VLAN"
 			target_dev="tr069-if"
 			uci set network.tr069_dev='device'
 			uci set network.tr069_dev.type='8021q'
@@ -267,18 +309,19 @@ apply_network() {
 		TR069_IFNAME=""
 	fi
 
-	if [ "$NET_DIRTY" -eq 1 ]; then
-		uci commit network || fail "Failed to commit network config"
+	if commit_managed network "$before" $NET_SECTIONS; then
+		NET_DIRTY=1
 	fi
 }
 
 apply_firewall() {
-	local ip
+	local ip before
 
-	remove_managed_firewall
+	revert_managed firewall $FW_SECTIONS
+	before="$(show_managed firewall $FW_SECTIONS)"
+	remove_managed firewall $FW_SECTIONS
 
 	if [ "$ENABLED" -eq 1 ]; then
-		FW_DIRTY=1
 		uci set firewall.tr069_zone='zone'
 		uci set firewall.tr069_zone.name='tr069'
 		uci add_list firewall.tr069_zone.network='tr069'
@@ -321,8 +364,8 @@ apply_firewall() {
 		fi
 	fi
 
-	if [ "$FW_DIRTY" -eq 1 ]; then
-		uci commit firewall || fail "Failed to commit firewall config"
+	if commit_managed firewall "$before" $FW_SECTIONS; then
+		FW_DIRTY=1
 	fi
 }
 

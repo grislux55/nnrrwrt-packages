@@ -29,7 +29,12 @@ start_service() {
 }
 
 stop_service() {
-	/usr/libexec/tr069-fake-apply stop >/dev/null 2>&1 || true
+	# A stop that a start follows, and the shutdown, keep the netifd and firewall
+	# sections: tr069-fake-apply commits them at the next start only when they differ.
+	case "$action" in
+		restart|reload|shutdown) ;;
+		*) /usr/libexec/tr069-fake-apply stop >/dev/null 2>&1 || true ;;
+	esac
 	rm -f /var/run/airoha-tr069-fake.sock
 }
 

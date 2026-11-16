@@ -1389,6 +1389,48 @@ fn test_state_lock_admits_one_holder() {
 }
 
 #[test]
+fn test_unchanged_state_files_are_not_rewritten() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = temp_dir("no-rewrite");
+    let mut cfg = FakeConfig::default();
+    cfg.state_dir = dir.to_string_lossy().into_owned();
+    let inodes = || -> Vec<u64> {
+        ["template.json", "model.json", "pending_events.json"]
+            .iter()
+            .map(|name| fs::metadata(dir.join(name)).unwrap().ino())
+            .collect()
+    };
+
+    let mut model = VirtualModel::load_or_init(&cfg).unwrap();
+    let written = inodes();
+
+    // The next load and saves of the same content leave the files in place.
+    VirtualModel::load_or_init(&cfg).unwrap();
+    model.save_template().unwrap();
+    model.save_model().unwrap();
+    model.save_pending().unwrap();
+    assert_eq!(inodes(), written);
+
+    // A changed value replaces its own file.
+    model
+        .set_single_from_ui("InternetGatewayDevice.DeviceInfo.ProvisioningCode", "LOCAL")
+        .unwrap();
+    let changed = inodes();
+    assert_eq!(changed[0], written[0]);
+    assert_ne!(changed[1], written[1]);
+    assert_eq!(changed[2], written[2]);
+
+    // The same content under another mode is written again with mode 0600.
+    let model_path = dir.join("model.json");
+    fs::set_permissions(&model_path, fs::Permissions::from_mode(0o644)).unwrap();
+    model.save_model().unwrap();
+    assert_ne!(inodes()[1], changed[1]);
+    assert_eq!(fs::metadata(&model_path).unwrap().permissions().mode() & 0o777, 0o600);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_format_unix_timestamp_iso8601_utc() {
     assert_eq!(format_unix_timestamp(0), "1970-01-01T00:00:00Z");
     assert_eq!(format_unix_timestamp(1_700_000_000), "2023-11-14T22:13:20Z");

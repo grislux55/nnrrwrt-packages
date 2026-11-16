@@ -1212,7 +1212,13 @@ impl StateLock {
     }
 }
 
+/// Writes `content` to `path` through a temporary file, fsync and rename, mode 0600.
+/// A file that already holds `content` with that mode stays as it is: the template is
+/// saved on every model load and the state directory is on flash.
 pub fn atomic_write_string(path: &Path, content: &str) -> Result<(), String> {
+    if file_holds(path, content) {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -1233,6 +1239,17 @@ pub fn atomic_write_string(path: &Path, content: &str) -> Result<(), String> {
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("failed to chmod {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("failed to rename {}: {e}", path.display()))
+}
+
+/// True when `path` is a regular file of mode 0600 holding exactly `content`.
+fn file_holds(path: &Path, content: &str) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    meta.is_file()
+        && meta.len() == content.len() as u64
+        && (meta.permissions().mode() & 0o777) == 0o600
+        && fs::read(path).is_ok_and(|current| current == content.as_bytes())
 }
 
 pub fn iso8601_now() -> String {
