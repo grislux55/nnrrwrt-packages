@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
@@ -468,8 +468,4 @@ fn merge_effects(dst: &mut ManagementEffects, src: &ManagementEffects) {
     if src.conn_req_password.is_some() {
         dst.conn_req_password = src.conn_req_password.clone();
     }
-}
-
-pub fn trigger_flag_new() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
 }

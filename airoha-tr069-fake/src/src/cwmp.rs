@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use quick_xml::escape::{escape as qxml_escape, unescape as qxml_unescape};
+use quick_xml::escape::unescape as qxml_unescape;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 use roxmltree::{Document, Node, ParsingOptions};
@@ -70,10 +70,6 @@ pub enum CwmpMessage {
 pub struct ParsedEnvelope {
     pub cwmp_id: Option<String>,
     pub message: CwmpMessage,
-}
-
-pub fn xml_escape(input: &str) -> String {
-    qxml_escape(input).into_owned()
 }
 
 pub fn xml_unescape(input: &str) -> String {

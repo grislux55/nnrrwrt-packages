@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::audit::AuditLogger;
 use crate::crypto_tls::{base64_encode, random_hex_nonce, TlsClientStream};
-use crate::net_iso::{connect_isolated_tcp, InterfaceRuntime};
+use crate::net_iso::{connect_isolated_tcp, wait_readable, InterfaceRuntime, ACCEPT_POLL};
 
 pub const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -928,9 +928,14 @@ impl ConnectionRequestServer {
             let realm_c = realm.clone();
             let tracker_c = Arc::clone(&nonce_tracker);
             let handle = std::thread::spawn(move || {
+                let mut accept_failing = false;
                 while !stop_c.load(Ordering::Relaxed) {
+                    if !wait_readable(&listener, ACCEPT_POLL) {
+                        continue;
+                    }
                     match listener.accept() {
                         Ok((mut stream, peer)) => {
+                            accept_failing = false;
                             let deadline = Instant::now() + CONN_REQ_TIMEOUT;
                             for _ in 0..MAX_CONN_REQ_REQUESTS {
                                 if !handle_conn_req(
@@ -947,10 +952,20 @@ impl ConnectionRequestServer {
                                 }
                             }
                         }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(50));
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => {
+                            // accept() also reports errors pending on the new connection and
+                            // a shortage of descriptors or memory. The listener outlives them.
+                            if !accept_failing {
+                                accept_failing = true;
+                                audit_c.record(
+                                    "WARN",
+                                    "conn_req",
+                                    &format!("Cannot accept a ConnectionRequest: {e}"),
+                                );
+                            }
+                            std::thread::sleep(ACCEPT_POLL);
                         }
-                        Err(_) => break,
                     }
                 }
             });

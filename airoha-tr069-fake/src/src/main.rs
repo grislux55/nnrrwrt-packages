@@ -17,7 +17,7 @@ use airoha_tr069_fake::config::FakeConfig;
 use airoha_tr069_fake::crypto_tls::random_u64;
 use airoha_tr069_fake::http::{ConnReqCreds, ConnectionRequestServer};
 use airoha_tr069_fake::model::{StateLock, VirtualModel};
-use airoha_tr069_fake::net_iso::InterfaceRuntime;
+use airoha_tr069_fake::net_iso::{wait_readable, InterfaceRuntime, ACCEPT_POLL};
 use airoha_tr069_fake::{
     apply_effects_to_config, apply_overlay_from_config, dump_sanitized_model_json,
     dump_sanitized_status_json, load_effective_cfg_and_model, load_raw_cfg_and_model,
@@ -154,7 +154,7 @@ fn run_inform_once(config_path: &Path) -> i32 {
         }
     };
     let audit = open_audit(&cfg);
-    let rt = InterfaceRuntime::inspect(&cfg.tr069_ifname);
+    let rt = InterfaceRuntime::inspect(&cfg.tr069_ifname).with_dns_servers();
     match run_cwmp_session(&mut cfg, &mut model, &rt, &[], 0, &audit, None) {
         Ok(summary) => {
             println!("Inform completed: rpcs_handled={}", summary.rpcs_handled);
@@ -571,10 +571,13 @@ fn run_daemon(config_path: &Path, sock_path: &Path) -> i32 {
             // What the Inform of this session reports.
             let endpoints = RuntimeEndpoints::of(&cfg, &active_rt);
             owe_value_change(&mut owed_events, reported_endpoints.as_ref(), &endpoints);
+            // The DNS servers are read per session. `active_rt` holds addresses only, so the
+            // refresh every 5 s compares addresses and starts no subprocess.
+            let session_rt = active_rt.with_dns_servers();
             match run_cwmp_session(
                 &mut cfg,
                 &mut model,
-                &active_rt,
+                &session_rt,
                 &owed_events,
                 retry.count,
                 &audit,
@@ -719,6 +722,9 @@ fn start_control_socket(
     let _ = listener.set_nonblocking(true);
     Some(std::thread::spawn(move || {
         while !stop_flag.load(Ordering::Relaxed) && !SIGNAL_STOP.load(Ordering::Relaxed) {
+            if !wait_readable(&listener, ACCEPT_POLL) {
+                continue;
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
@@ -742,10 +748,9 @@ fn start_control_socket(
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                // A shortage of descriptors or memory passes. The socket outlives it.
+                Err(_) => std::thread::sleep(ACCEPT_POLL),
             }
         }
     }))

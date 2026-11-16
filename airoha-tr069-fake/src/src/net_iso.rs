@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket,
@@ -14,6 +14,15 @@ use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use serde_json::Value as JsonValue;
 
+/// Longest wait of a listener thread for a connection before it checks its stop flag again.
+pub const ACCEPT_POLL: Duration = Duration::from_millis(500);
+
+const IF_INET6_PATH: &str = "/proc/net/if_inet6";
+/// Host, link and site scope bits of an if_inet6 line. A global address has none of them.
+const IF_INET6_SCOPE_NOT_GLOBAL: u32 = 0x70;
+const IF_INET6_FLAG_DADFAILED: u32 = 0x08;
+const IF_INET6_FLAG_TENTATIVE: u32 = 0x40;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InterfaceRuntime {
     pub ifname: String,
@@ -24,6 +33,8 @@ pub struct InterfaceRuntime {
 }
 
 impl InterfaceRuntime {
+    /// Reads the addresses of `ifname` from the kernel. `dns_servers` stays empty: the caller
+    /// that opens a session adds them with with_dns_servers().
     pub fn inspect(ifname: &str) -> Self {
         let mut rt = Self {
             ifname: ifname.to_owned(),
@@ -32,8 +43,19 @@ impl InterfaceRuntime {
         if ifname.is_empty() {
             return rt;
         }
-        rt.ipv4_addrs = read_ip_addrs_v4(ifname);
-        (rt.ipv6_addrs, rt.ipv6_tentative) = read_ip_addrs_v6(ifname);
+        let (ipv4_addrs, ipv6_order) = read_device_addrs(ifname);
+        rt.ipv4_addrs = ipv4_addrs;
+        (rt.ipv6_addrs, rt.ipv6_tentative) = read_ipv6_addrs(ifname, &ipv6_order);
+        rt
+    }
+
+    /// Returns a copy that also holds the DNS servers netifd reports for the two management
+    /// interfaces, read with two `ubus` calls.
+    pub fn with_dns_servers(&self) -> Self {
+        let mut rt = self.clone();
+        if rt.ifname.is_empty() {
+            return rt;
+        }
         rt.dns_servers = read_ubus_dns("tr069");
         for dns in read_ubus_dns("tr069_6") {
             if !rt.dns_servers.contains(&dns) {
@@ -63,68 +85,114 @@ fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
-fn read_ip_addrs_v4(ifname: &str) -> Vec<Ipv4Addr> {
-    let Ok(out) = Command::new("ip")
-        .args(["-4", "-o", "addr", "show", "dev", ifname, "scope", "global"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
+/// IPv4 and IPv6 addresses of `ifname` as getifaddrs() lists them, which is the order of
+/// `ip addr show dev <ifname>`. Loopback IPv4 addresses are left out.
+///
+/// netifd adds every address with scope global, so the IPv4 list is the set that
+/// `ip -4 addr show dev <ifname> scope global` prints for an interface it manages. The IPv6
+/// list carries neither scope nor DAD state and only orders what read_ipv6_addrs() returns.
+fn read_device_addrs(ifname: &str) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs() stores the head of a list that stays valid until freeifaddrs().
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return (ipv4, ipv6);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut res = Vec::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        for win in parts.windows(2) {
-            if win[0] == "inet" {
-                if let Some(ip_str) = win[1].split('/').next() {
-                    if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                        res.push(ip);
-                    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list returned above.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_name.is_null() || ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_name is a NUL-terminated string owned by the list.
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
+        // An address label such as "eth0:1" names its device ahead of the colon.
+        if name.split(|b| *b == b':').next() != Some(ifname.as_bytes()) {
+            continue;
+        }
+        // SAFETY: ifa_addr points to at least a sockaddr. The copy needs no alignment.
+        let sa = unsafe { std::ptr::read_unaligned(ifa.ifa_addr) };
+        match libc::c_int::from(sa.sa_family) {
+            libc::AF_INET => {
+                let sin = ifa.ifa_addr.cast::<libc::sockaddr_in>();
+                // SAFETY: an AF_INET entry holds a sockaddr_in. The copy needs no alignment.
+                let sin = unsafe { std::ptr::read_unaligned(sin) };
+                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if !ip.is_loopback() && !ipv4.contains(&ip) {
+                    ipv4.push(ip);
                 }
             }
+            libc::AF_INET6 => {
+                let sin6 = ifa.ifa_addr.cast::<libc::sockaddr_in6>();
+                // SAFETY: an AF_INET6 entry holds a sockaddr_in6. The copy needs no alignment.
+                let sin6 = unsafe { std::ptr::read_unaligned(sin6) };
+                ipv6.push(Ipv6Addr::from(sin6.sin6_addr.s6_addr));
+            }
+            _ => {}
         }
     }
-    res
+    // SAFETY: `head` came from getifaddrs() and no reference into the list is left.
+    unsafe { libc::freeifaddrs(head) };
+    (ipv4, ipv6)
 }
 
-fn read_ip_addrs_v6(ifname: &str) -> (Vec<Ipv6Addr>, Vec<Ipv6Addr>) {
-    let Ok(out) = Command::new("ip")
-        .args(["-6", "-o", "addr", "show", "dev", ifname, "scope", "global"])
-        .output()
-    else {
+/// Global IPv6 addresses of `ifname`, usable and DAD-tentative, in the order of
+/// `device_order`. /proc/net/if_inet6 lists them by hash bucket, and the first usable address
+/// is the source address of a session.
+fn read_ipv6_addrs(ifname: &str, device_order: &[Ipv6Addr]) -> (Vec<Ipv6Addr>, Vec<Ipv6Addr>) {
+    let Ok(text) = std::fs::read_to_string(IF_INET6_PATH) else {
         return (Vec::new(), Vec::new());
     };
-    if !out.status.success() {
-        return (Vec::new(), Vec::new());
-    }
-    parse_ip_addrs_v6(&String::from_utf8_lossy(&out.stdout))
+    let (mut usable, mut tentative) = parse_if_inet6(&text, ifname);
+    sort_by_device_order(&mut usable, device_order);
+    sort_by_device_order(&mut tentative, device_order);
+    (usable, tentative)
 }
 
-/// Splits `ip -6 -o addr show` output into usable and DAD-tentative addresses and drops dadfailed ones.
-pub fn parse_ip_addrs_v6(text: &str) -> (Vec<Ipv6Addr>, Vec<Ipv6Addr>) {
+/// Sorts `addrs` into the order of `device_order`. Addresses that it does not hold keep
+/// their order behind the others.
+fn sort_by_device_order(addrs: &mut [Ipv6Addr], device_order: &[Ipv6Addr]) {
+    addrs.sort_by_key(|ip| {
+        device_order
+            .iter()
+            .position(|known| known == ip)
+            .unwrap_or(device_order.len())
+    });
+}
+
+/// Splits the global addresses that /proc/net/if_inet6 lists for `ifname` into usable and
+/// DAD-tentative ones and drops those that failed DAD.
+///
+/// A line holds the address as 32 hex digits, then the interface index, the prefix length,
+/// the scope and the flags in hex, then the interface name.
+pub fn parse_if_inet6(text: &str, ifname: &str) -> (Vec<Ipv6Addr>, Vec<Ipv6Addr>) {
     let mut usable = Vec::new();
     let mut tentative = Vec::new();
     for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.contains(&"dadfailed") {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let &[addr, _ifindex, _prefix_len, scope, flags, name] = fields.as_slice() else {
+            continue;
+        };
+        if name != ifname || addr.len() != 32 {
             continue;
         }
-        let dst = if parts.contains(&"tentative") {
-            &mut tentative
-        } else {
-            &mut usable
+        let (Ok(addr), Ok(scope), Ok(flags)) = (
+            u128::from_str_radix(addr, 16),
+            u32::from_str_radix(scope, 16),
+            u32::from_str_radix(flags, 16),
+        ) else {
+            continue;
         };
-        for win in parts.windows(2) {
-            if win[0] == "inet6" {
-                if let Some(ip_str) = win[1].split('/').next() {
-                    if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
-                        dst.push(ip);
-                    }
-                }
-            }
+        if scope & IF_INET6_SCOPE_NOT_GLOBAL != 0 || flags & IF_INET6_FLAG_DADFAILED != 0 {
+            continue;
+        }
+        if flags & IF_INET6_FLAG_TENTATIVE != 0 {
+            tentative.push(Ipv6Addr::from(addr));
+        } else {
+            usable.push(Ipv6Addr::from(addr));
         }
     }
     (usable, tentative)
@@ -153,6 +221,28 @@ fn read_ubus_dns(iface: &str) -> Vec<IpAddr> {
         }
     }
     res
+}
+
+/// Waits until `fd` is readable or `timeout` has passed and tells whether it is readable.
+///
+/// An interrupted poll() returns at once. Any other poll() failure sleeps for `timeout`, so
+/// a loop around this function never spins.
+pub fn wait_readable(fd: &impl AsRawFd, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `pfd` is one valid pollfd for the duration of the call.
+    let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+    if rc > 0 {
+        return true;
+    }
+    if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+        std::thread::sleep(timeout);
+    }
+    false
 }
 
 pub fn bind_socket_to_device(fd: libc::c_int, ifname: &str) -> io::Result<()> {
@@ -717,6 +807,7 @@ pub fn parse_dns_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[test]
     fn link_local_ipv6_dns_uses_interface_scope_id() {
@@ -778,14 +869,22 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_parser_separates_tentative_and_drops_dadfailed() {
-        let out = concat!(
-            "7: tr069-if    inet6 fd00:46::2/64 scope global tentative \\       valid_lft forever preferred_lft forever\n",
-            "7: tr069-if    inet6 2001:db8:46::2/64 scope global \\       valid_lft forever preferred_lft forever\n",
-            "7: tr069-if    inet6 2001:db8:46::3/64 scope global tentative dadfailed \\       valid_lft forever preferred_lft forever\n",
-            "7: tr069-if    inet6 2001:db8:46::4/64 scope global deprecated noprefixroute \\       valid_lft forever preferred_lft 0sec\n",
+    fn if_inet6_parser_keeps_the_global_addresses_of_one_interface() {
+        // Flags: 40 tentative, 48 tentative after a failed DAD, 20 deprecated, 80 permanent.
+        // Scopes: 00 global, 10 host, 20 link.
+        let text = concat!(
+            "00000000000000000000000000000001 01 80 10 80       lo\n",
+            "fe80000000000000021122fffe334455 07 40 20 80 tr069-if\n",
+            "fd000046000000000000000000000002 07 40 00 40 tr069-if\n",
+            "20010db8004600000000000000000002 07 40 00 00 tr069-if\n",
+            "20010db8004600000000000000000003 07 40 00 48 tr069-if\n",
+            "20010db8004600000000000000000004 07 40 00 20 tr069-if\n",
+            "20010db8004600000000000000000005 02 40 00 80     eth0\n",
+            "20010db8004600000000000000000006 08 40 00 80 tr069-if2\n",
+            "20010db80046 07 40 00 80 tr069-if\n",
+            "not an address line\n",
         );
-        let (usable, tentative) = parse_ip_addrs_v6(out);
+        let (usable, tentative) = parse_if_inet6(text, "tr069-if");
         assert_eq!(
             usable,
             vec![
@@ -794,5 +893,33 @@ mod tests {
             ]
         );
         assert_eq!(tentative, vec!["fd00:46::2".parse::<Ipv6Addr>().unwrap()]);
+        assert_eq!(parse_if_inet6(text, "lo"), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn ipv6_addresses_follow_the_device_order() {
+        let first: Ipv6Addr = "2001:db8:46::2".parse().unwrap();
+        let second: Ipv6Addr = "fd00:46::2".parse().unwrap();
+        let third: Ipv6Addr = "2001:db8:46::4".parse().unwrap();
+        let mut addrs = vec![first, second, third];
+        sort_by_device_order(&mut addrs, &[third, second]);
+        assert_eq!(addrs, vec![third, second, first]);
+        sort_by_device_order(&mut addrs, &[]);
+        assert_eq!(addrs, vec![third, second, first]);
+    }
+
+    #[test]
+    fn device_addr_reader_skips_ipv4_loopback_and_unknown_interfaces() {
+        let (ipv4, _) = read_device_addrs("lo");
+        assert!(ipv4.iter().all(|ip| !ip.is_loopback()));
+        assert_eq!(read_device_addrs("no-such-if0"), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn wait_readable_reports_a_pending_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        assert!(!wait_readable(&listener, Duration::from_millis(20)));
+        let _client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        assert!(wait_readable(&listener, Duration::from_secs(2)));
     }
 }
