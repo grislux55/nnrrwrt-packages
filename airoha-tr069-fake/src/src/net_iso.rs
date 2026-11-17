@@ -207,20 +207,32 @@ fn read_ubus_dns(iface: &str) -> Vec<IpAddr> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let Ok(val) = serde_json::from_str::<JsonValue>(&text) else {
+    let Ok(status) = serde_json::from_str::<JsonValue>(&text) else {
         return Vec::new();
     };
-    let mut res = Vec::new();
-    if let Some(arr) = val.get("dns-server").and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                if let Ok(ip) = s.parse::<IpAddr>() {
-                    res.push(ip);
-                }
-            }
+    parse_ubus_dns(&status)
+}
+
+/// Returns the DNS servers in the reply of `ubus call network.interface.<name> status`.
+///
+/// tr069-fake-apply sets `peerdns 0` on both management interfaces. netifd then keeps the
+/// servers of a DHCP or DHCPv6 lease out of the system resolver and lists them under
+/// `inactive`; the top-level list holds the servers of the `dns` option only.
+pub fn parse_ubus_dns(status: &JsonValue) -> Vec<IpAddr> {
+    let lists = [
+        status.get("dns-server"),
+        status.get("inactive").and_then(|inactive| inactive.get("dns-server")),
+    ];
+    let mut servers = Vec::new();
+    for item in lists.into_iter().flatten().filter_map(JsonValue::as_array).flatten() {
+        let Some(ip) = item.as_str().and_then(|text| text.parse::<IpAddr>().ok()) else {
+            continue;
+        };
+        if !servers.contains(&ip) {
+            servers.push(ip);
         }
     }
-    res
+    servers
 }
 
 /// Waits until `fd` is readable or `timeout` has passed and tells whether it is readable.
@@ -913,6 +925,38 @@ mod tests {
         let (ipv4, _) = read_device_addrs("lo");
         assert!(ipv4.iter().all(|ip| !ip.is_loopback()));
         assert_eq!(read_device_addrs("no-such-if0"), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn ubus_dns_parser_reads_the_configured_and_the_lease_servers() {
+        // Shape of netifd's reply with `peerdns 0`: the `dns` option at the top level, the
+        // servers of the lease under `inactive`.
+        let status: JsonValue = serde_json::from_str(
+            r#"{
+                "up": true,
+                "dns-server": ["192.0.2.53"],
+                "inactive": {
+                    "route": [{"target": "0.0.0.0", "mask": 0, "nexthop": "192.0.2.1"}],
+                    "dns-server": ["192.0.2.54", "2001:db8:46::53", "192.0.2.53", "none", 7]
+                }
+            }"#,
+        )
+        .expect("status");
+        let expected: Vec<IpAddr> = vec![
+            "192.0.2.53".parse().unwrap(),
+            "192.0.2.54".parse().unwrap(),
+            "2001:db8:46::53".parse().unwrap(),
+        ];
+        assert_eq!(parse_ubus_dns(&status), expected);
+
+        let lease_only = serde_json::json!({
+            "dns-server": [],
+            "inactive": { "dns-server": ["192.0.2.54"] }
+        });
+        assert_eq!(parse_ubus_dns(&lease_only), expected[1..2].to_vec());
+        assert!(parse_ubus_dns(&serde_json::json!({ "up": false })).is_empty());
+        assert!(parse_ubus_dns(&serde_json::json!({ "inactive": ["192.0.2.54"] })).is_empty());
+        assert!(parse_ubus_dns(&JsonValue::Null).is_empty());
     }
 
     #[test]
