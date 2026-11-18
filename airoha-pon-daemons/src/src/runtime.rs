@@ -4,11 +4,20 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// ARPHRD_NONE control interfaces reference their PON netdev through iflink; OAM uses the parent MAC.
+/// ARPHRD_NONE control interfaces reference their PON netdev through iflink.
 pub fn parent_interface_mac(interface: &str) -> io::Result<[u8; 6]> {
     let path = parent_interface_path(interface)?;
 
     parse_mac(&read_trimmed(path.join("address"))?)
+}
+
+/// OAM sends from the address the EPON MAC registers with. Drivers without the epon_mac_address
+/// attribute register with the parent MAC.
+pub fn epon_registration_mac(interface: &str) -> io::Result<[u8; 6]> {
+    match parent_xpon_attribute(interface, "epon_mac_address")? {
+        Some(path) => parse_mac(&read_trimmed(path)?),
+        None => parent_interface_mac(interface),
+    }
 }
 
 pub fn parent_xpon_attribute(interface: &str, attribute: &str) -> io::Result<Option<PathBuf>> {
