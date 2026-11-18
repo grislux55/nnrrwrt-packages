@@ -3,6 +3,9 @@
 		"description": "Grant access to NNRRWrt advanced settings",
 		"read": {
 			"uci": [ "nnrrwrt_advanced" ],
+			"ubus": {
+				"file": [ "read" ]
+			},
 			"file": {
 				"/sys/module/airoha_xpon/parameters/dying_gasp": [ "read" ]
 			}

@@ -7,7 +7,7 @@
 
 return view.extend({
 	load: function() {
-		return L.resolveDefault(fs.read_direct('/sys/module/airoha_xpon/parameters/dying_gasp'), '');
+		return fs.trimmed('/sys/module/airoha_xpon/parameters/dying_gasp');
 	},
 
 	render: function(running) {
