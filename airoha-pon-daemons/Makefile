@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=airoha-pon-daemons
 PKG_VERSION:=0.3.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_URL:=https://github.com/grislux55/nnrrwrt-packages/tree/main/airoha-pon-daemons
 
 PKG_LICENSE:=GPL-2.0-only
