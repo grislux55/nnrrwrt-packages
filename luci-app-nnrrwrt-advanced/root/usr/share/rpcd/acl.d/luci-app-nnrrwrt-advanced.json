@@ -1,0 +1,14 @@
+{
+	"luci-app-nnrrwrt-advanced": {
+		"description": "Grant access to NNRRWrt advanced settings",
+		"read": {
+			"uci": [ "nnrrwrt_advanced" ],
+			"file": {
+				"/sys/module/airoha_xpon/parameters/dying_gasp": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "nnrrwrt_advanced" ]
+		}
+	}
+}

@@ -1,0 +1,21 @@
+{
+	"admin/advanced": {
+		"title": "Advanced",
+		"order": 70,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-nnrrwrt-advanced" ],
+			"uci": { "nnrrwrt_advanced": true }
+		}
+	},
+	"admin/advanced/settings": {
+		"title": "Settings",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "nnrrwrt-advanced/settings"
+		}
+	}
+}

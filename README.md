@@ -35,6 +35,12 @@ Userspace daemon, CLI utility, and LuCI web application feed for [NNRRWrt](https
 | `luci-app-iptv` | 0.1.0 | `luci-app-iptv/` | Dedicated `br-iptv` port bridge and `nftables` bridge forward isolation / IPTV 独立网桥与 `nftables` 桥接转发隔离配置应用 |
 | `luci-app-firewall-ppe` | 0.1.0 | `luci-app-firewall-ppe/` | PPE flow-binding switch and L2/L3 packet-rate thresholds under Network → Firewall / 防火墙设置中的 PPE 流绑定开关与 L2/L3 包速率门槛 |
 
+### 5. Advanced Settings / 高级设置
+
+| Package / 软件包 | Version / 版本 | Directory / 目录 | Purpose / 职责说明 |
+| --- | --- | --- | --- |
+| `luci-app-nnrrwrt-advanced` | 0.1.0 | `luci-app-nnrrwrt-advanced/` | Advanced menu (`admin/advanced`) with one tab per setting: CPU throttling temperature, dying gasp switch, crash record count. The UCI file `nnrrwrt_advanced` and its init script ship in the NNRRWrt AN7581 base-files / 高级菜单（`admin/advanced`），每项设置一个选项卡：CPU 降频温度、掉电遗言开关、崩溃记录保留数；UCI 文件 `nnrrwrt_advanced` 与启动脚本随 NNRRWrt AN7581 base-files 提供 |
+
 ## OpenWrt Feed Integration / Feed 接入方式
 
 ```text

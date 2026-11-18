@@ -1,0 +1,59 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-nnrrwrt-advanced\n"
+"PO-Revision-Date: 2026-11-18 12:40+0800\n"
+"Last-Translator: OpenWrt LuCI community\n"
+"Language: zh_Hans\n"
+"Language-Team: Chinese (Simplified)\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Advanced"
+msgstr "高级"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Settings of NNRRWrt features that the other configuration pages do not cover. Each tab states when a change takes effect."
+msgstr "其他配置页面未涵盖的 NNRRWrt 功能设置。各选项卡说明修改的生效时间。"
+
+msgid "Thermal"
+msgstr "温控"
+
+msgid "Dying gasp"
+msgstr "掉电遗言"
+
+msgid "Crash log"
+msgstr "崩溃日志"
+
+msgid "Throttling temperature (°C)"
+msgstr "降频温度（°C）"
+
+msgid "The CPU frequency limit tightens one step per second while the temperature at or above this value keeps rising, relaxes while it falls, and is released once the temperature is 1 °C below it. The value applies to both CPU thermal zones at once and at every boot. Allowed range 60 to 110; the 120 °C shutdown temperature is fixed."
+msgstr "温度达到此值后仍在上升时，CPU 频率上限每秒收紧一级；温度下降时逐级放宽；低于此值 1 °C 后解除限制。设置对两个 CPU 温控区立即生效，每次启动时重新写入。可设范围 60 到 110，120 °C 关机温度固定。"
+
+msgid "Act on supply drop"
+msgstr "掉电时处理"
+
+msgid "On a supply drop the ONU signals a dying gasp on the PON, switches off USB power, holds the LAN 1 PHY in reset and reboots after 28 s if it keeps running. Takes effect after the next reboot. Only boards with the supply-drop interrupt wired use it (Nokia XG-040G-MD)."
+msgstr "供电下降时，ONU 在 PON 上发送掉电遗言，关闭 USB 供电，将 LAN 1 PHY 保持在复位状态，28 秒后仍在运行则重启。下次重启后生效。仅接有掉电中断的单板使用此功能（Nokia XG-040G-MD）。"
+
+msgid "State in the running system"
+msgstr "运行中的状态"
+
+msgid "Enabled"
+msgstr "已启用"
+
+msgid "Disabled"
+msgstr "已停用"
+
+msgid "Unknown"
+msgstr "未知"
+
+msgid "Crash records kept"
+msgstr "保留的崩溃记录数"
+
+msgid "Number of records kept under /etc/crashlog after a panic, a dying gasp or an unclean reset. 0 saves no new records and keeps the existing ones. Takes effect at the next boot. Allowed range 0 to 10."
+msgstr "内核崩溃、掉电遗言或非正常复位后，在 /etc/crashlog 下保留的记录数。0 表示不再保存新记录，已有记录保持不变。下次启动时生效。可设范围 0 到 10。"
