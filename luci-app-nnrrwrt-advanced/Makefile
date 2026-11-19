@@ -7,7 +7,7 @@ LUCI_URL:=https://github.com/grislux55/nnrrwrt-packages/tree/main/luci-app-nnrrw
 LUCI_DEPENDS:=+luci-base
 LUCI_PKGARCH:=all
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_MAINTAINER:=grislux55 <jebchou.hg@gmail.com>
 
 PKG_LICENSE:=Apache-2.0

@@ -2,16 +2,18 @@
 	"luci-app-nnrrwrt-advanced": {
 		"description": "Grant access to NNRRWrt advanced settings",
 		"read": {
-			"uci": [ "nnrrwrt_advanced" ],
+			"uci": [ "nnrrwrt_advanced", "airoha_accel" ],
 			"ubus": {
 				"file": [ "read" ]
 			},
 			"file": {
-				"/sys/module/airoha_xpon/parameters/dying_gasp": [ "read" ]
+				"/sys/module/airoha_xpon/parameters/dying_gasp": [ "read" ],
+				"/proc/sys/net/ipv4/tcp_available_congestion_control": [ "read" ],
+				"/proc/sys/net/ipv4/tcp_congestion_control": [ "read" ]
 			}
 		},
 		"write": {
-			"uci": [ "nnrrwrt_advanced" ]
+			"uci": [ "nnrrwrt_advanced", "airoha_accel" ]
 		}
 	}
 }

@@ -1,8 +1,8 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: luci-app-nnrrwrt-advanced\n"
-"PO-Revision-Date: 2026-11-18 12:40+0800\n"
-"Last-Translator: OpenWrt LuCI community\n"
+"PO-Revision-Date: 2026-11-19 23:55+0800\n"
+"Last-Translator: NNRRWrt Project\n"
 "Language: zh_Hans\n"
 "Language-Team: Chinese (Simplified)\n"
 "MIME-Version: 1.0\n"
@@ -27,6 +27,9 @@ msgstr "掉电遗言"
 
 msgid "Crash log"
 msgstr "崩溃日志"
+
+msgid "TCP congestion"
+msgstr "TCP 拥塞控制"
 
 msgid "Throttling temperature (°C)"
 msgstr "降频温度（°C）"
@@ -57,3 +60,39 @@ msgstr "保留的崩溃记录数"
 
 msgid "Number of records kept under /etc/crashlog after a panic, a dying gasp or an unclean reset. 0 saves no new records and keeps the existing ones. Takes effect at the next boot. Allowed range 0 to 10."
 msgstr "内核崩溃、掉电遗言或非正常复位后，在 /etc/crashlog 下保留的记录数。0 表示不再保存新记录，已有记录保持不变。下次启动时生效。可设范围 0 到 10。"
+
+msgid "TCP congestion control"
+msgstr "TCP 拥塞控制算法"
+
+msgid "Congestion control algorithm written to /proc/sys/net/ipv4/tcp_congestion_control at start and reload. Applies to new TCP connections at once; existing connections keep their current algorithm."
+msgstr "启动和重载时写入 /proc/sys/net/ipv4/tcp_congestion_control 的拥塞控制算法。修改对新建 TCP 连接立即生效，已有连接保持原算法。"
+
+msgid "Active in the running system"
+msgstr "当前生效算法"
+
+msgid "PPE Binding"
+msgstr "PPE 绑定"
+
+msgid "PPE sends a flow to hardware after its packet rate reaches the configured threshold. Lower values offload flows sooner; higher values keep short flows on the CPU."
+msgstr "一条流的包速率达到门槛后，PPE 会把它交给硬件处理。数值越低，流越快进入 PPE；数值越高，短连接会在 CPU 上停留更久。"
+
+msgid "Binding thresholds"
+msgstr "绑定门槛"
+
+msgid "Use custom thresholds"
+msgstr "使用自定义门槛"
+
+msgid "When disabled, the kernel uses the upstream 30 packets per second threshold for L2 and L3 flows."
+msgstr "关闭后，内核为 L2 和 L3 流量使用上游默认的每秒 30 个包。"
+
+msgid "L2 bridge threshold (pps)"
+msgstr "L2 网桥门槛（pps）"
+
+msgid "Packet rate that moves a bridged flow from software processing to PPE."
+msgstr "网桥转发流量从软件处理进入 PPE 的包速率。"
+
+msgid "L3 routing threshold (pps)"
+msgstr "L3 路由门槛（pps）"
+
+msgid "Packet rate that moves a routed or NAT flow from software processing to PPE."
+msgstr "路由或 NAT 流量从软件处理进入 PPE 的包速率。"
